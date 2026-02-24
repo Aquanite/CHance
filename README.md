@@ -1,6 +1,10 @@
 # CHance Language Specification (H26)
 
-This document defines the H26 language standard for CHance as implemented by the `chancec` compiler in this repository. It describes the full surface area observed in the compiler, runtime, and stdlib sources.
+CHance is compiled by `chancec`, the front-end compiler in this repository. It parses `.ce` source, performs semantic analysis, and emits textual ChanceCode bytecode (`.ccb`) before handing off to `chancecodec` for backend codegen.
+
+For questions or contributions, contact Azureian on Discord or email me@nhornby.com.
+
+This document defines the H26 language standard for CHance as implemented by `chancec`. It describes the full surface area observed in the compiler, runtime, and stdlib sources.
 
 ## 1. Toolchain and Artifacts
 - **Source:** `.ce`
