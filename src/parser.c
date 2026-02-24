@@ -2803,7 +2803,9 @@ static Node *parse_primary(Parser *ps)
     {
         Node *n = new_node(ND_INT);
         n->int_val = t.int_val;
+        n->int_uval = t.int_uval;
         n->int_is_unsigned = t.int_is_unsigned;
+        n->int_width = t.int_width;
         n->line = t.line;
         n->col = t.col;
         n->src = lexer_source(ps->lx);
@@ -2843,6 +2845,8 @@ static Node *parse_primary(Parser *ps)
     {
         Node *n = new_node(ND_INT);
         n->int_val = t.int_val;
+        n->int_uval = (uint64_t)t.int_val;
+        n->int_width = 0;
         n->type = type_char();
         n->line = t.line;
         n->col = t.col;
@@ -2877,6 +2881,8 @@ static Node *parse_primary(Parser *ps)
         {
             Node *n = new_node(ND_INT);
             n->int_val = 1;
+            n->int_uval = 1;
+            n->int_width = 0;
             n->type = type_bool();
             n->line = t.line;
             n->col = t.col;
@@ -2887,6 +2893,8 @@ static Node *parse_primary(Parser *ps)
         {
             Node *n = new_node(ND_INT);
             n->int_val = 0;
+            n->int_uval = 0;
+            n->int_width = 0;
             n->type = type_bool();
             n->line = t.line;
             n->col = t.col;
@@ -2957,6 +2965,8 @@ static Node *parse_primary(Parser *ps)
         {
             Node *n = new_node(ND_INT);
             n->int_val = ev;
+            n->int_uval = (uint64_t)ev;
+            n->int_width = 0;
             n->line = t.line;
             n->col = t.col;
             n->src = lexer_source(ps->lx);
@@ -3060,6 +3070,8 @@ static int parser_call_type_args_ahead(Parser *ps)
     if (first.kind != TK_LT)
         return 0;
     int depth = 0;
+    int paren_depth = 0;
+    int bracket_depth = 0;
     int offset = 0;
     while (1)
     {
@@ -3083,16 +3095,31 @@ static int parser_call_type_args_ahead(Parser *ps)
         case TK_SHR:
             depth -= 2;
             break;
+        case TK_LPAREN:
+            paren_depth++;
+            break;
+        case TK_RPAREN:
+            if (paren_depth > 0)
+                paren_depth--;
+            else if (depth > 0 && bracket_depth == 0)
+                return 0;
+            break;
+        case TK_LBRACKET:
+            bracket_depth++;
+            break;
+        case TK_RBRACKET:
+            if (bracket_depth > 0)
+                bracket_depth--;
+            else if (depth > 0 && paren_depth == 0)
+                return 0;
+            break;
         case TK_EOF:
         case TK_SEMI:
             return 0;
-        case TK_LPAREN:
-        case TK_RPAREN:
         case TK_LBRACE:
         case TK_RBRACE:
-        case TK_LBRACKET:
-        case TK_RBRACKET:
-            // allowed within type expressions
+            if (depth > 0 && paren_depth == 0 && bracket_depth == 0)
+                return 0;
             break;
         default:
             break;
@@ -3266,6 +3293,8 @@ static Node *parse_postfix_suffixes(Parser *ps, Node *expr)
                     {
                         Node *n = new_node(ND_INT);
                         n->int_val = ev;
+                        n->int_uval = (uint64_t)ev;
+                        n->int_width = 0;
                         n->line = field.line;
                         n->col = field.col;
                         n->src = lexer_source(ps->lx);
@@ -5363,11 +5392,7 @@ Node *parse_unit(Parser *ps)
         exit(1);
     }
 
-    if (fn_count == 0)
-    {
-        diag_error_at(lexer_source(ps->lx), 1, 1, "no functions found");
-        exit(1);
-    }
+    (void)fn_count;
 
     Node *u = (Node *)xcalloc(1, sizeof(Node));
     u->kind = ND_UNIT;

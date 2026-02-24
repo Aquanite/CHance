@@ -2290,6 +2290,12 @@ static bool ccb_emit_const(StringList *body, CCValueType ty, int64_t value)
     return string_list_appendf(body, "  const %s %lld", cc_type_name(ty), (long long)value);
 }
 
+static bool ccb_emit_const_u64(StringList *body, CCValueType ty, uint64_t value)
+{
+    return string_list_appendf(body, "  const %s %llu", cc_type_name(ty),
+                               (unsigned long long)value);
+}
+
 static bool ccb_emit_const_zero(StringList *body, CCValueType ty)
 {
     if (!body)
@@ -3543,11 +3549,84 @@ static int ccb_emit_struct_initializer(CcbFunctionBuilder *fb, const Node *var_d
         member.line = init->line;
         member.col = init->col;
 
+        const Node *value = init->init.elems ? init->init.elems[i] : NULL;
+        if (type_is_address_only(member.type))
+        {
+            if (!value)
+                continue;
+            if (value->kind == ND_INIT_LIST && (value->init.is_zero || value->init.count == 0))
+                continue;
+
+            size_t field_size = ccb_type_size_bytes(member.type);
+            if (field_size == 0)
+            {
+                diag_error_at(value->src, value->line, value->col,
+                              "struct field size is unknown for initializer");
+                return 1;
+            }
+
+            uint8_t *field_bytes = (uint8_t *)calloc(field_size, 1);
+            if (!field_bytes)
+                return 1;
+            if (!ccb_store_constant_value(member.type, value, field_bytes, field_size))
+            {
+                free(field_bytes);
+                diag_error_at(value->src, value->line, value->col,
+                              "initializer for aggregate struct field must be constant");
+                return 1;
+            }
+
+            if (ccb_emit_member_address(fb, &member, NULL, NULL))
+            {
+                free(field_bytes);
+                return 1;
+            }
+
+            Type *field_ptr_ty = type_ptr((Type *)member.type);
+            CcbLocal *field_ptr = ccb_local_add(fb, NULL, field_ptr_ty, false, false);
+            if (!field_ptr)
+            {
+                free(field_bytes);
+                return 1;
+            }
+            if (!ccb_emit_store_local(fb, field_ptr))
+            {
+                free(field_bytes);
+                return 1;
+            }
+
+            for (size_t b = 0; b < field_size; ++b)
+            {
+                if (!ccb_emit_load_local(fb, field_ptr))
+                {
+                    free(field_bytes);
+                    return 1;
+                }
+                if (ccb_emit_pointer_offset(fb, (int)b, value))
+                {
+                    free(field_bytes);
+                    return 1;
+                }
+                if (!ccb_emit_const(&fb->body, CC_TYPE_U8, (int64_t)field_bytes[b]))
+                {
+                    free(field_bytes);
+                    return 1;
+                }
+                if (!ccb_emit_store_indirect(&fb->body, CC_TYPE_U8))
+                {
+                    free(field_bytes);
+                    return 1;
+                }
+            }
+
+            free(field_bytes);
+            continue;
+        }
+
         CCValueType field_ty = CC_TYPE_I32;
         if (ccb_emit_member_address(fb, &member, &field_ty, NULL))
             return 1;
 
-        const Node *value = init->init.elems ? init->init.elems[i] : NULL;
         if (ccb_emit_expr_basic(fb, value))
             return 1;
 
@@ -3742,9 +3821,99 @@ static int ccb_emit_array_initializer(CcbFunctionBuilder *fb, const Node *var_de
 
     if (type_is_address_only(elem_type) && !init->init.is_zero)
     {
-        diag_error_at(init->src, init->line, init->col,
-                      "array initializer lists for aggregate element types are not supported yet");
-        return 1;
+        size_t elem_size = ccb_type_size_bytes(elem_type);
+        if (elem_size == 0)
+        {
+            diag_error_at(init->src, init->line, init->col,
+                          "array element size is unknown for initializer");
+            return 1;
+        }
+
+        if (ccb_emit_array_zero(fb, var_decl, var_name, array_type))
+            return 1;
+
+        Type byte_type = {0};
+        byte_type.kind = TY_U8;
+
+        Node base_ref = {0};
+        base_ref.kind = ND_VAR;
+        base_ref.var_ref = var_name;
+        base_ref.type = type_ptr(&byte_type);
+        base_ref.var_type = (Type *)array_type;
+        base_ref.var_is_array = 1;
+        base_ref.var_is_const = var_decl ? var_decl->var_is_const : 0;
+        base_ref.var_is_global = var_decl ? var_decl->var_is_global : 0;
+        base_ref.src = var_decl ? var_decl->src : NULL;
+        base_ref.line = var_decl ? var_decl->line : 0;
+        base_ref.col = var_decl ? var_decl->col : 0;
+
+        int limit = init->init.count;
+        if (array_type->array.length >= 0 && limit > array_type->array.length)
+            limit = array_type->array.length;
+
+        for (int i = 0; i < limit; ++i)
+        {
+            const Node *value = (init->init.elems && i < init->init.count) ? init->init.elems[i] : NULL;
+            if (!value)
+            {
+                diag_error_at(init->src, init->line, init->col,
+                              "missing initializer expression for array element %d", i);
+                return 1;
+            }
+
+            uint8_t *elem_bytes = (uint8_t *)calloc(elem_size, 1);
+            if (!elem_bytes)
+                return 1;
+            if (!ccb_store_constant_value(elem_type, value, elem_bytes, elem_size))
+            {
+                free(elem_bytes);
+                diag_error_at(value->src, value->line, value->col,
+                              "initializer for aggregate array element must be constant");
+                return 1;
+            }
+
+            for (size_t b = 0; b < elem_size; ++b)
+            {
+                size_t offset = (size_t)i * elem_size + b;
+                Node idx_lit = {0};
+                idx_lit.kind = ND_INT;
+                idx_lit.int_val = (int64_t)offset;
+                idx_lit.type = type_i32();
+                idx_lit.src = value->src;
+                idx_lit.line = value->line;
+                idx_lit.col = value->col;
+
+                Node idx_expr = {0};
+                idx_expr.kind = ND_INDEX;
+                idx_expr.lhs = &base_ref;
+                idx_expr.rhs = &idx_lit;
+                idx_expr.type = &byte_type;
+                idx_expr.src = value->src;
+                idx_expr.line = value->line;
+                idx_expr.col = value->col;
+
+                CCValueType elem_ty = CC_TYPE_U8;
+                if (ccb_emit_index_address(fb, &idx_expr, &elem_ty, NULL))
+                {
+                    free(elem_bytes);
+                    return 1;
+                }
+                if (!ccb_emit_const(&fb->body, CC_TYPE_U8, (int64_t)elem_bytes[b]))
+                {
+                    free(elem_bytes);
+                    return 1;
+                }
+                if (!ccb_emit_store_indirect(&fb->body, elem_ty))
+                {
+                    free(elem_bytes);
+                    return 1;
+                }
+            }
+
+            free(elem_bytes);
+        }
+
+        return 0;
     }
 
     if (init->init.is_zero || init->init.count == 0)
@@ -4107,7 +4276,7 @@ static int ccb_emit_call_like(CcbFunctionBuilder *fb, const Node *expr, bool for
         }
         else if (is_indirect)
         {
-            const char *suffix = expr->call_is_varargs ? " varargs" : "";
+            const char *suffix = call_is_varargs ? " varargs" : "";
             if (!string_list_appendf(&fb->body, "  call_indirect %s %s%s", ret_name, arg_text, suffix))
                 rc = 1;
         }
@@ -4119,9 +4288,11 @@ static int ccb_emit_call_like(CcbFunctionBuilder *fb, const Node *expr, bool for
                               "function call missing symbol name");
                 rc = 1;
             }
-            else if (!string_list_appendf(&fb->body, "  call %s %s %s", expr->call_name, ret_name, arg_text))
+            else
             {
-                rc = 1;
+                const char *suffix = call_is_varargs ? " varargs" : "";
+                if (!string_list_appendf(&fb->body, "  call %s %s %s%s", expr->call_name, ret_name, arg_text, suffix))
+                    rc = 1;
             }
         }
         free(arg_text);
@@ -4157,6 +4328,13 @@ static int ccb_emit_expr_basic_impl(CcbFunctionBuilder *fb, const Node *expr)
     case ND_INT:
     {
         CCValueType ty = map_type_to_cc(expr->type);
+        bool is_unsigned = ccb_value_type_is_integer(ty) && !ccb_value_type_is_signed(ty);
+        if (is_unsigned)
+        {
+            if (!ccb_emit_const_u64(&fb->body, ty, expr->int_uval))
+                return 1;
+            return 0;
+        }
         if (!ccb_emit_const(&fb->body, ty, expr->int_val))
             return 1;
         return 0;
@@ -5339,9 +5517,9 @@ static int ccb_emit_expr_basic_impl(CcbFunctionBuilder *fb, const Node *expr)
         if (ccb_emit_member_address(fb, expr, &field_ty, &field_type))
             return 1;
 
-        if (field_type && field_type->kind == TY_STRUCT)
+        if (field_type && (field_type->kind == TY_STRUCT || field_type->kind == TY_ARRAY))
         {
-            // Struct fields are handled by address; caller will copy as needed
+            // Struct/array fields are handled by address; caller will copy or index as needed
             return 0;
         }
 
@@ -6539,12 +6717,16 @@ static bool ccb_format_global_initializer(const Node *expr, const Type *ty, char
         snprintf(buffer, bufsz, "null");
         return true;
     case ND_INT:
-        if (ty && ty->kind == TY_PTR && expr->int_val == 0)
+        if (ty && ty->kind == TY_PTR && expr->int_uval == 0)
         {
             snprintf(buffer, bufsz, "null");
             return true;
         }
-        snprintf(buffer, bufsz, "%lld", (long long)expr->int_val);
+        if ((ty && (ty->kind == TY_U8 || ty->kind == TY_U16 || ty->kind == TY_U32 || ty->kind == TY_U64)) ||
+            (!ty && expr->int_is_unsigned))
+            snprintf(buffer, bufsz, "%llu", (unsigned long long)expr->int_uval);
+        else
+            snprintf(buffer, bufsz, "%lld", (long long)expr->int_val);
         return true;
     case ND_FLOAT:
     {
@@ -7252,7 +7434,11 @@ static bool ccb_eval_const_float64(const Node *expr, double *out_value)
         *out_value = expr->float_val;
         return true;
     case ND_INT:
-        *out_value = (double)expr->int_val;
+        if (expr->type && (expr->type->kind == TY_U8 || expr->type->kind == TY_U16 ||
+                           expr->type->kind == TY_U32 || expr->type->kind == TY_U64))
+            *out_value = (double)expr->int_uval;
+        else
+            *out_value = (double)expr->int_val;
         return true;
     case ND_NULL:
         *out_value = 0.0;
@@ -7461,7 +7647,7 @@ static bool ccb_flatten_array_initializer(const Type *array_type, const Node *in
         for (int i = 0; i < limit; ++i)
         {
             const Node *elem = (init->init.elems && i < init->init.count) ? init->init.elems[i] : NULL;
-            if (!elem || !ccb_store_scalar_bytes(array_type->array.elem, elem, buffer + (size_t)i * elem_size, elem_size))
+            if (!elem || !ccb_store_constant_value(array_type->array.elem, elem, buffer + (size_t)i * elem_size, elem_size))
             {
                 free(buffer);
                 return false;

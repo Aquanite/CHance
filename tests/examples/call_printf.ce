@@ -67,6 +67,11 @@ extend from "C" i32 remove(char*);
 hide alias string = char*;
 hide alias uint32_t = u32;
 
+hide struct NLGraphicsVertex {
+    float[3] position;
+    float[4] color;
+};
+
 struct CCDiagnostic
 {
     i32 code;
@@ -789,6 +794,20 @@ expose fun main() -> i32
     u32 uliteral = 88u;
 
     assert(uliteral == (88 as u32), "unsigned literal 88u == 88 as u32");
+
+    NLGraphicsVertex[3] vertices = {
+        {{ 0.0f,  0.75f, 0.0f}, {1.0f, 0.2f, 0.2f, 1.0f}},
+        {{-0.75f, -0.70f, 0.0f}, {0.2f, 1.0f, 0.3f, 1.0f}},
+        {{ 0.75f, -0.70f, 0.0f}, {0.2f, 0.5f, 1.0f, 1.0f}}
+    };
+
+    // verify each is correctly initialized
+    assert(vertices[0].position[0] == 0.0f && vertices[0].position[1] == 0.75f && vertices[0].position[2] == 0.0f, "vertex 0 position correct");
+    assert(vertices[0].color[0] == 1.0f && vertices[0].color[1] == 0.2f && vertices[0].color[2] == 0.2f && vertices[0].color[3] == 1.0f, "vertex 0 color correct");
+    assert(vertices[1].position[0] == -0.75f && vertices[1].position[1] == -0.70f && vertices[1].position[2] == 0.0f, "vertex 1 position correct");
+    assert(vertices[1].color[0] == 0.2f && vertices[1].color[1] == 1.0f && vertices[1].color[2] == 0.3f && vertices[1].color[3] == 1.0f, "vertex 1 color correct");
+    assert(vertices[2].position[0] == 0.75f && vertices[2].position[1] == -0.70f && vertices[2].position[2] == 0.0f, "vertex 2 position correct");
+    assert(vertices[2].color[0] == 0.2f && vertices[2].color[1] == 0.5f && vertices[2].color[2] == 1.0f && vertices[2].color[3] == 1.0f, "vertex 2 color correct");
 
 
     Std.IO.printnl("All tests completed successfully! %d total asserts.", total_test_count);

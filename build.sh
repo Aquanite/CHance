@@ -8,10 +8,15 @@ set -euo pipefail
 PRESET=${1:-linux-release}
 
 mkdir -p build
+
 # Prefer Ninja if available, otherwise use Unix Makefiles
 GENERATOR="Unix Makefiles"
 if command -v ninja >/dev/null 2>&1; then
   GENERATOR="Ninja"
 fi
-cmake -S . -B build -G "$GENERATOR" -DCMAKE_BUILD_TYPE=Release
+
+cmake -S . -B build -G "$GENERATOR" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_FLAGS_RELEASE="-O2"
+
 cmake --build build --config Release

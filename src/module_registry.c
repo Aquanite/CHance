@@ -95,6 +95,27 @@ static int match_strings(const char *a, const char *b)
     return strcmp(a, b) == 0;
 }
 
+static int module_name_matches(const char *a, const char *b)
+{
+    if (!a || !b)
+        return 0;
+    if (strcmp(a, b) == 0)
+        return 1;
+    size_t a_len = strlen(a);
+    size_t b_len = strlen(b);
+    if (a_len > b_len)
+    {
+        if (a_len > b_len + 1 && a[a_len - b_len - 1] == '.' && strcmp(a + (a_len - b_len), b) == 0)
+            return 1;
+    }
+    else if (b_len > a_len)
+    {
+        if (b_len > a_len + 1 && b[b_len - a_len - 1] == '.' && strcmp(b + (b_len - a_len), a) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 void module_registry_register_struct(const char *module_full, Type *type)
 {
     if (!module_full || !type)
@@ -233,6 +254,76 @@ Type *module_registry_canonical_type(Type *ty)
             Type *resolved = module_registry_lookup_struct(ty->import_module, ty->import_type_name);
             if (!resolved)
                 resolved = module_registry_lookup_enum(ty->import_module, ty->import_type_name);
+            if (!resolved && ty->import_type_name)
+            {
+                Type *name_match = NULL;
+                int match_count = 0;
+                for (int i = 0; i < struct_count; ++i)
+                {
+                    if (match_strings(struct_entries[i].name, ty->import_type_name))
+                    {
+                        name_match = struct_entries[i].type;
+                        match_count++;
+                        if (match_count > 1)
+                            break;
+                    }
+                }
+                if (match_count == 1)
+                    resolved = name_match;
+                else if (!resolved && ty->import_module)
+                {
+                    Type *qualified_match = NULL;
+                    int qualified_count = 0;
+                    for (int i = 0; i < struct_count; ++i)
+                    {
+                        if (match_strings(struct_entries[i].name, ty->import_type_name) &&
+                            module_name_matches(struct_entries[i].module_full, ty->import_module))
+                        {
+                            qualified_match = struct_entries[i].type;
+                            qualified_count++;
+                            if (qualified_count > 1)
+                                break;
+                        }
+                    }
+                    if (qualified_count == 1)
+                        resolved = qualified_match;
+                }
+                else if (!resolved)
+                {
+                    Type *enum_match = NULL;
+                    int enum_matches = 0;
+                    for (int i = 0; i < enum_count; ++i)
+                    {
+                        if (match_strings(enum_entries[i].name, ty->import_type_name))
+                        {
+                            enum_match = enum_entries[i].type;
+                            enum_matches++;
+                            if (enum_matches > 1)
+                                break;
+                        }
+                    }
+                    if (enum_matches == 1)
+                        resolved = enum_match;
+                    else if (!resolved && ty->import_module)
+                    {
+                        Type *enum_qualified = NULL;
+                        int enum_qualified_count = 0;
+                        for (int i = 0; i < enum_count; ++i)
+                        {
+                            if (match_strings(enum_entries[i].name, ty->import_type_name) &&
+                                module_name_matches(enum_entries[i].module_full, ty->import_module))
+                            {
+                                enum_qualified = enum_entries[i].type;
+                                enum_qualified_count++;
+                                if (enum_qualified_count > 1)
+                                    break;
+                            }
+                        }
+                        if (enum_qualified_count == 1)
+                            resolved = enum_qualified;
+                    }
+                }
+            }
             ty->import_resolved = resolved;
             if (resolved)
             {

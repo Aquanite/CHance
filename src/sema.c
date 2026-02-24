@@ -8,6 +8,19 @@
 #include <stdint.h>
 #include <ctype.h>
 
+static int sema_allow_implicit_voidp = 0;
+static int sema_allow_implicit_sizeof = 0;
+
+void sema_set_allow_implicit_voidp(int enable)
+{
+    sema_allow_implicit_voidp = enable ? 1 : 0;
+}
+
+void sema_set_allow_implicit_sizeof(int enable)
+{
+    sema_allow_implicit_sizeof = enable ? 1 : 0;
+}
+
 enum
 {
     INLINE_PARAM_LIMIT = 4,
@@ -340,9 +353,13 @@ static void sema_imported_function_insert(SemaContext *sc, const char *name, con
     {
         if (funcsig_equal(&set->candidates[i].symbol.sig, &symbol->sig))
         {
-            const char *existing_mod = set->candidates[i].module_full ? set->candidates[i].module_full : "<unknown>";
-            const char *incoming_mod = module_full ? module_full : "<unknown>";
-            diag_error("ambiguous import: function '%s' from module '%s' conflicts with module '%s'", name, existing_mod, incoming_mod);
+            const char *existing_mod = set->candidates[i].module_full;
+            if (!existing_mod || !module_full || strcmp(existing_mod, module_full) == 0)
+                return;
+            diag_error("ambiguous import: function '%s' from module '%s' conflicts with module '%s'",
+                       name,
+                       existing_mod ? existing_mod : "<unknown>",
+                       module_full ? module_full : "<unknown>");
             exit(1);
         }
     }
@@ -2728,10 +2745,27 @@ static int can_assign(Type *target, Node *rhs)
     Type *canon_target = canonicalize_type_deep(target);
     if (!canon_target)
         return 0;
+    if (sema_allow_implicit_sizeof &&
+        (rhs->kind == ND_SIZEOF || rhs->kind == ND_ALIGNOF || rhs->kind == ND_OFFSETOF) &&
+        type_is_int(canon_target))
+    {
+        rhs->type = canon_target;
+        return 1;
+    }
     if (canon_target->kind == TY_PTR && rhs->kind == ND_NULL)
     {
         rhs->type = canon_target;
         return 1;
+    }
+    if (sema_allow_implicit_voidp && canon_target->kind == TY_PTR && canon_target->pointee &&
+        canon_target->pointee->kind == TY_VOID)
+    {
+        Type *rhs_ty = canonicalize_type_deep(rhs->type);
+        if (rhs_ty && rhs_ty->kind == TY_PTR)
+        {
+            rhs->type = canon_target;
+            return 1;
+        }
     }
     if (rhs->type && type_equal(canon_target, rhs->type))
         return 1;
@@ -2845,14 +2879,35 @@ static void apply_default_vararg_promotion(Node **slot)
     }
 }
 
+static Type *sema_resolve_import_type(Type *ty)
+{
+    if (!ty)
+        return NULL;
+    Type *canon = canonicalize_type_deep(ty);
+    if (canon && canon->kind == TY_IMPORT)
+    {
+        const char *module = canon->import_module;
+        const char *name = canon->import_type_name;
+        if (module && *module && name && *name)
+        {
+            Type *resolved = module_registry_lookup_struct(module, name);
+            if (resolved)
+                return resolved;
+        }
+    }
+    return canon ? canon : ty;
+}
+
 static void check_initializer_for_type(SemaContext *sc, Node *init, Type *target)
 {
     if (!init || !target)
         return;
-    target = canonicalize_type_deep(target);
+    target = sema_resolve_import_type(target);
+    if (!target)
+        return;
     if (target && target->kind == TY_ARRAY)
     {
-        Type *elem = canonicalize_type_deep(target->array.elem);
+        Type *elem = sema_resolve_import_type(target->array.elem);
         if (target->array.is_unsized)
         {
             if (init->kind == ND_INIT_LIST && !init->init.is_zero)
@@ -2892,12 +2947,6 @@ static void check_initializer_for_type(SemaContext *sc, Node *init, Type *target
             int elem_is_aggregate = elem &&
                                     (elem->kind == TY_STRUCT ||
                                      (elem->kind == TY_ARRAY && !elem->array.is_unsized));
-            if (elem_is_aggregate)
-            {
-                diag_error_at(init->src, init->line, init->col,
-                              "array initializer lists for aggregate element types are not supported yet");
-                exit(1);
-            }
 
             for (int i = 0; i < init->init.count; ++i)
             {
@@ -2910,17 +2959,24 @@ static void check_initializer_for_type(SemaContext *sc, Node *init, Type *target
                 }
                 if (elem_init->kind == ND_INIT_LIST)
                 {
-                    diag_error_at(elem_init->src, elem_init->line, elem_init->col,
-                                  "nested initializer lists are not supported for array elements yet");
-                    exit(1);
+                    if (!elem_is_aggregate)
+                    {
+                        diag_error_at(elem_init->src, elem_init->line, elem_init->col,
+                                      "nested initializer lists are not supported for array elements yet");
+                        exit(1);
+                    }
+                    check_initializer_for_type(sc, elem_init, elem);
                 }
-                check_expr(sc, elem_init);
-                Type *expected_elem = elem ? elem : &ty_i32;
-                if (expected_elem && !can_assign(expected_elem, elem_init))
+                else
                 {
-                    diag_error_at(elem_init->src, elem_init->line, elem_init->col,
-                                  "initializer element type mismatch");
-                    exit(1);
+                    check_expr(sc, elem_init);
+                    Type *expected_elem = elem ? elem : &ty_i32;
+                    if (expected_elem && !can_assign(expected_elem, elem_init))
+                    {
+                        diag_error_at(elem_init->src, elem_init->line, elem_init->col,
+                                      "initializer element type mismatch");
+                        exit(1);
+                    }
                 }
             }
             init->type = target;
@@ -3318,6 +3374,23 @@ static int expr_has_any_cast(const Node *expr)
     return 0;
 }
 
+static int node_is_sizeof_like(const Node *expr)
+{
+    return expr && (expr->kind == ND_SIZEOF || expr->kind == ND_ALIGNOF || expr->kind == ND_OFFSETOF);
+}
+
+static int coerce_sizeof_to_type(Node *expr, Type *target)
+{
+    if (!sema_allow_implicit_sizeof || !expr || !target)
+        return 0;
+    if (!node_is_sizeof_like(expr))
+        return 0;
+    if (!type_is_int(target))
+        return 0;
+    expr->type = canonicalize_type_deep(target);
+    return 1;
+}
+
 static const Node *find_const_storage_origin(Node *expr);
 static const Node *find_const_pointer_origin(Node *expr);
 static const Node *find_pointer_to_const_origin(Node *expr);
@@ -3571,7 +3644,26 @@ static void check_expr(SemaContext *sc, Node *e)
     if (e->kind == ND_INT)
     {
         if (!e->type)
-            e->type = e->int_is_unsigned ? &ty_u32 : &ty_i32;
+        {
+            int want_64 = e->int_width == 64;
+            if (!want_64)
+            {
+                if (e->int_is_unsigned)
+                {
+                    if (e->int_uval > UINT32_MAX)
+                        want_64 = 1;
+                }
+                else
+                {
+                    if (e->int_val < INT32_MIN || e->int_val > INT32_MAX)
+                        want_64 = 1;
+                }
+            }
+            if (e->int_is_unsigned)
+                e->type = want_64 ? &ty_u64 : &ty_u32;
+            else
+                e->type = want_64 ? &ty_i64 : &ty_i32;
+        }
         return;
     }
     if (e->kind == ND_FLOAT)
@@ -4158,6 +4250,13 @@ static void check_expr(SemaContext *sc, Node *e)
                           base->strct.field_names[idx]);
             exit(1);
         }
+        if (e->type->kind == TY_ARRAY && !e->type->array.is_unsized)
+        {
+            Type *elem = e->type->array.elem ? e->type->array.elem : &ty_i32;
+            e->var_type = e->type;
+            e->var_is_array = 1;
+            e->type = type_ptr(elem);
+        }
         return;
     }
     if (e->kind == ND_ADDR)
@@ -4185,7 +4284,7 @@ static void check_expr(SemaContext *sc, Node *e)
             exit(1);
         }
         Type *addr_type = target->type;
-        if (target->kind == ND_VAR && target->var_type && target->var_type->kind == TY_ARRAY && !target->var_type->array.is_unsized)
+        if (target->var_type && target->var_type->kind == TY_ARRAY && !target->var_type->array.is_unsized)
             addr_type = target->var_type;
         e->type = type_ptr(addr_type);
         return;
@@ -4255,7 +4354,11 @@ static void check_expr(SemaContext *sc, Node *e)
         {
             if (type_is_int(rhs_type) && coerce_int_literal_to_type(e->lhs, rhs_type, "+"))
                 lhs_type = canonicalize_type_deep(e->lhs->type);
+            if (!type_equal(lhs_type, rhs_type) && coerce_sizeof_to_type(e->lhs, rhs_type))
+                lhs_type = canonicalize_type_deep(e->lhs->type);
             if (!type_equal(lhs_type, rhs_type) && type_is_int(lhs_type) && coerce_int_literal_to_type(e->rhs, lhs_type, "+"))
+                rhs_type = canonicalize_type_deep(e->rhs->type);
+            if (!type_equal(lhs_type, rhs_type) && coerce_sizeof_to_type(e->rhs, lhs_type))
                 rhs_type = canonicalize_type_deep(e->rhs->type);
             if (!type_equal(lhs_type, rhs_type))
             {
@@ -4303,7 +4406,11 @@ static void check_expr(SemaContext *sc, Node *e)
         {
             if (type_is_int(rhs_type) && coerce_int_literal_to_type(e->lhs, rhs_type, "-"))
                 lhs_type = canonicalize_type_deep(e->lhs->type);
+            if (!type_equal(lhs_type, rhs_type) && coerce_sizeof_to_type(e->lhs, rhs_type))
+                lhs_type = canonicalize_type_deep(e->lhs->type);
             if (!type_equal(lhs_type, rhs_type) && type_is_int(lhs_type) && coerce_int_literal_to_type(e->rhs, lhs_type, "-"))
+                rhs_type = canonicalize_type_deep(e->rhs->type);
+            if (!type_equal(lhs_type, rhs_type) && coerce_sizeof_to_type(e->rhs, lhs_type))
                 rhs_type = canonicalize_type_deep(e->rhs->type);
             if (!type_equal(lhs_type, rhs_type))
             {
@@ -4344,7 +4451,11 @@ static void check_expr(SemaContext *sc, Node *e)
             const char *op = (e->kind == ND_MUL) ? "*" : (e->kind == ND_DIV ? "/" : "%");
             if (type_is_int(rhs_type) && coerce_int_literal_to_type(e->lhs, rhs_type, op))
                 lhs_type = canonicalize_type_deep(e->lhs->type);
+            if (!type_equal(lhs_type, rhs_type) && coerce_sizeof_to_type(e->lhs, rhs_type))
+                lhs_type = canonicalize_type_deep(e->lhs->type);
             if (!type_equal(lhs_type, rhs_type) && type_is_int(lhs_type) && coerce_int_literal_to_type(e->rhs, lhs_type, op))
+                rhs_type = canonicalize_type_deep(e->rhs->type);
+            if (!type_equal(lhs_type, rhs_type) && coerce_sizeof_to_type(e->rhs, lhs_type))
                 rhs_type = canonicalize_type_deep(e->rhs->type);
             if (!type_equal(lhs_type, rhs_type))
             {
@@ -4409,7 +4520,11 @@ static void check_expr(SemaContext *sc, Node *e)
         {
             if (type_is_int(rhs_type) && coerce_int_literal_to_type(e->lhs, rhs_type, op_symbol))
                 lhs_type = canonicalize_type_deep(e->lhs->type);
+            if (!type_equal(lhs_type, rhs_type) && coerce_sizeof_to_type(e->lhs, rhs_type))
+                lhs_type = canonicalize_type_deep(e->lhs->type);
             if (!type_equal(lhs_type, rhs_type) && type_is_int(lhs_type) && coerce_int_literal_to_type(e->rhs, lhs_type, op_symbol))
+                rhs_type = canonicalize_type_deep(e->rhs->type);
+            if (!type_equal(lhs_type, rhs_type) && coerce_sizeof_to_type(e->rhs, lhs_type))
                 rhs_type = canonicalize_type_deep(e->rhs->type);
         }
         if (!type_equal(lhs_type, rhs_type))
@@ -4560,15 +4675,30 @@ static void check_expr(SemaContext *sc, Node *e)
             diag_error_at(e->src, e->line, e->col, "array index is not an integer");
             exit(1);
         }
-        if (!e->lhs->type || e->lhs->type->kind != TY_PTR ||
-            !e->lhs->type->pointee)
+        Type *lhs_type = canonicalize_type_deep(e->lhs->type);
+        if (!lhs_type)
+        {
+            diag_error_at(e->src, e->line, e->col,
+                          "subscripted value is not an array or pointer");
+            exit(1);
+        }
+        Type *elem_type = NULL;
+        if (lhs_type->kind == TY_PTR && lhs_type->pointee)
+        {
+            elem_type = canonicalize_type_deep(lhs_type->pointee);
+        }
+        else if (lhs_type->kind == TY_ARRAY && !lhs_type->array.is_unsized)
+        {
+            elem_type = canonicalize_type_deep(lhs_type->array.elem);
+            e->lhs->type = type_ptr(elem_type ? elem_type : &ty_i32);
+        }
+        else
         {
             diag_error_at(e->src, e->line, e->col,
                           "subscripted value is not an array or pointer");
             exit(1);
         }
         // If the pointer points to a struct, result type is the struct type
-        Type *elem_type = canonicalize_type_deep(e->lhs->type->pointee);
         if (elem_type && elem_type->kind == TY_STRUCT)
         {
             e->type = elem_type;
@@ -4988,6 +5118,13 @@ static void check_expr(SemaContext *sc, Node *e)
             if (backend)
                 e->call_name = backend;
             call_is_indirect = 0;
+        }
+
+        if (!call_is_indirect && direct_sym && direct_sym->is_extern)
+        {
+            const char *import_name = direct_sym->name ? direct_sym->name : resolved_name;
+            if (import_name && *import_name)
+                sema_track_imported_function(sc, import_name, NULL, direct_sym);
         }
 
         Type *ret_type = func_sig->func.ret ? func_sig->func.ret : &ty_i32;

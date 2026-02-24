@@ -1,0 +1,8 @@
+extend from "C" int printf(char* format, ...);
+extend from "C" void exit(int status);
+
+[Export]
+expose noreturn fun __cert__panic(char* message) -> void {
+    printf("__cert__panic: %s\n", message);
+    exit(1);
+}

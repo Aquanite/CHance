@@ -1,0 +1,20 @@
+extend from "C" void* malloc(u64 size);
+extend from "C" void free(void* ptr);
+
+extend fun __cert__panic(char* message) -> void;
+
+[Export]
+expose fun __cert__malloc(u64 size) -> void* {
+    void* ptr = malloc(size);
+    if (ptr == null) {
+        __cert__panic("Out of memory");
+    }
+    ret ptr;
+}
+
+[Export]
+expose fun __cert__free(void* ptr) -> void {
+    if (ptr != null) {
+        free(ptr);
+    }
+}

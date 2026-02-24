@@ -129,7 +129,9 @@ typedef struct
     const char *lexeme; // pointer into buffer
     int length;
     int64_t int_val;
+    uint64_t int_uval;
     int int_is_unsigned;
+    int int_width;
     double float_val;
     int float_is_f32;
     int line;
@@ -323,7 +325,9 @@ struct Node
     struct Node *lhs;
     struct Node *rhs;
     int64_t int_val;  // for ND_INT
+    uint64_t int_uval; // for ND_INT
     int int_is_unsigned;
+    int int_width;
     double float_val; // for ND_FLOAT
     // Source location for diagnostics
     int line;
@@ -623,5 +627,7 @@ void sema_register_foreign_unit_symbols(SemaContext *sc, Node *target_unit, Node
 void sema_track_imported_function(SemaContext *sc, const char *name, const char *module_full, const Symbol *symbol);
 Symbol *sema_copy_imported_function_symbols(const SemaContext *sc, int *out_count);
 Symbol *sema_copy_imported_global_symbols(const SemaContext *sc, int *out_count);
+void sema_set_allow_implicit_voidp(int enable);
+void sema_set_allow_implicit_sizeof(int enable);
 
 #endif // CHANCE_AST_H

@@ -339,6 +339,10 @@ static void usage(const char *prog)
           "  -vd             Verbose + optimizer deep-dive visuals\n");
   fprintf(stderr,
           "  --no-ansi        Disable colored diagnostics (verbose too)\n");
+    fprintf(stderr,
+      "  --implicit-voidp Allow implicit pointer to void* conversions\n");
+      fprintf(stderr,
+        "  --implicit-sizeof Allow implicit sizeof/alignof/offsetof to integer conversions\n");
   fprintf(stderr, "  --library         Emit a .cclib library instead of "
                   "compiling/linking\n");
 }
@@ -1025,13 +1029,674 @@ static void strip_utf8_bom(char *text)
     memmove(text, text + 3, strlen(text + 3) + 1);
 }
 
+static int locate_cclib_path(const char *exe_dir, const char *subdir,
+                             const char *filename, char *out, size_t outsz)
+{
+  if (!out || outsz == 0 || !subdir || !filename)
+    return 0;
+  out[0] = '\0';
+
+  if (exe_dir && exe_dir[0])
+  {
+    snprintf(out, outsz, "%s%c%s%c%s", exe_dir, CHANCE_PATH_SEP, subdir,
+             CHANCE_PATH_SEP, filename);
+    if (is_regular_file(out))
+      return 1;
+    char parent[1024];
+    if (parent_directory(exe_dir, parent, sizeof(parent)) == 0 && parent[0])
+    {
+      snprintf(out, outsz, "%s%c%s%c%s", parent, CHANCE_PATH_SEP, subdir,
+               CHANCE_PATH_SEP, filename);
+      if (is_regular_file(out))
+        return 1;
+    }
+    out[0] = '\0';
+    return 0;
+  }
+
+  const char *home_env = getenv("CHANCE_HOME");
+  if (!home_env || !home_env[0])
+    home_env = getenv("CHANCEC_HOME");
+  if (!home_env || !home_env[0])
+    home_env = getenv("CHANCE_ROOT");
+  if (home_env && home_env[0])
+  {
+    snprintf(out, outsz, "%s%c%s%c%s", home_env, CHANCE_PATH_SEP, subdir,
+             CHANCE_PATH_SEP, filename);
+    if (is_regular_file(out))
+      return 1;
+  }
+
+  const char *path_env = getenv("PATH");
+  if (path_env)
+  {
+    const char *p = path_env;
+    while (*p)
+    {
+      const char *s = p;
+      while (*p && *p != ':')
+        p++;
+      size_t seg_len = (size_t)(p - s);
+      if (seg_len > 0)
+      {
+        char candidate[1024];
+        if (snprintf(candidate, sizeof(candidate), "%.*s/%s/%s",
+                     (int)seg_len, s, subdir, filename) > 0)
+        {
+          if (is_regular_file(candidate))
+          {
+            snprintf(out, outsz, "%s", candidate);
+            return 1;
+          }
+        }
+      }
+      if (*p)
+        p++;
+    }
+  }
+
+  return 0;
+}
+
+static int parse_project_block_value(FILE *f, int *lineno,
+                                     const char *initial_value,
+                                     char *out, size_t outsz)
+{
+  if (!out || outsz == 0)
+    return -1;
+  out[0] = '\0';
+  if (!initial_value)
+    return 0;
+
+  const char *start = initial_value;
+  while (*start && isspace((unsigned char)*start))
+    ++start;
+  if (*start != '{')
+  {
+    snprintf(out, outsz, "%s", initial_value);
+    return 0;
+  }
+
+  start++;
+  while (*start && isspace((unsigned char)*start))
+    ++start;
+  size_t len = 0;
+  const char *end = strchr(start, '}');
+  if (end)
+  {
+    const char *after_end = end + 1;
+    while (*after_end && isspace((unsigned char)*after_end))
+      ++after_end;
+    if (*after_end == '\0')
+    {
+      size_t chunk = (size_t)(end - start);
+      if (chunk >= outsz)
+        chunk = outsz - 1;
+      memcpy(out, start, chunk);
+      out[chunk] = '\0';
+      return 0;
+    }
+  }
+
+  if (*start)
+  {
+    len = strnlen(start, outsz - 1);
+    memcpy(out, start, len);
+    out[len] = '\0';
+  }
+
+  char line[2048];
+  while (fgets(line, sizeof(line), f))
+  {
+    if (lineno)
+      (*lineno)++;
+    char work[2048];
+    snprintf(work, sizeof(work), "%s", line);
+    char trimmed[2048];
+    snprintf(trimmed, sizeof(trimmed), "%s", work);
+    trim_whitespace_inplace(trimmed);
+    if (strcmp(trimmed, "}") == 0)
+      return 0;
+
+    size_t seg_len = strlen(work);
+    while (seg_len > 0 && (work[seg_len - 1] == '\n' || work[seg_len - 1] == '\r'))
+      --seg_len;
+    if (seg_len > 0)
+    {
+      if (len + 1 < outsz)
+      {
+        if (len > 0)
+          out[len++] = '\n';
+        size_t copy = seg_len;
+        if (copy > outsz - 1 - len)
+          copy = outsz - 1 - len;
+        memcpy(out + len, work, copy);
+        len += copy;
+        out[len] = '\0';
+      }
+    }
+  }
+  return -1;
+}
+
+typedef struct
+{
+  const char **out;
+  char **project_output_alloc;
+  int *output_overridden;
+  int *stop_after_ccb;
+  int *stop_after_asm;
+  int *no_link;
+  int *emit_library;
+  int *freestanding;
+  int *freestanding_requested;
+  int *m32;
+  int *opt_level;
+  int *debug_symbols;
+  int *strip_metadata;
+  int *strip_hard;
+  int *obfuscate;
+  AsmSyntax *asm_syntax;
+  TargetArch *target_arch;
+  const char **chancecode_backend;
+  const char **chancecodec_cmd_override;
+  const char **host_cc_cmd_override;
+  TargetOS *target_os;
+  char ***include_dirs;
+  int *include_dir_count;
+  const char **obj_override;
+  int *implicit_voidp;
+  int *implicit_sizeof;
+  ProjectInputList symbol_ref_ce_list;
+  ProjectInputList symbol_ref_cclib_list;
+} ProjectArgState;
+
+static int project_args_push(char ***items, int *count, int *cap, const char *value)
+{
+  if (!items || !count || !cap || !value)
+    return -1;
+  if (*count == *cap)
+  {
+    int new_cap = *cap ? (*cap * 2) : 8;
+    char **grown = (char **)realloc(*items, sizeof(char *) * (size_t)new_cap);
+    if (!grown)
+      return -1;
+    *items = grown;
+    *cap = new_cap;
+  }
+  (*items)[*count] = xstrdup(value);
+  if (!(*items)[*count])
+    return -1;
+  (*count)++;
+  return 0;
+}
+
+static int project_args_tokenize(const char *text, char ***out_args, int *out_count)
+{
+  if (!out_args || !out_count)
+    return -1;
+  *out_args = NULL;
+  *out_count = 0;
+  if (!text)
+    return 0;
+  int cap = 0;
+  const char *p = text;
+  while (*p)
+  {
+    while (*p && (isspace((unsigned char)*p) || *p == ','))
+      ++p;
+    if (!*p)
+      break;
+    char token[1024];
+    size_t len = 0;
+    char quote = 0;
+    if (*p == '"' || *p == '\'')
+    {
+      quote = *p++;
+    }
+    while (*p)
+    {
+      if (quote)
+      {
+        if (*p == quote)
+        {
+          ++p;
+          break;
+        }
+      }
+      else if (isspace((unsigned char)*p) || *p == ',')
+      {
+        break;
+      }
+      if (*p == '\\' && p[1])
+      {
+        if (len + 1 < sizeof(token))
+          token[len++] = p[1];
+        p += 2;
+        continue;
+      }
+      if (len + 1 < sizeof(token))
+        token[len++] = *p;
+      ++p;
+    }
+    token[len] = '\0';
+    if (len > 0)
+    {
+      if (project_args_push(out_args, out_count, &cap, token) != 0)
+        return -1;
+    }
+  }
+  return 0;
+}
+
+static void project_args_free(char **args, int count)
+{
+  if (!args)
+    return;
+  for (int i = 0; i < count; ++i)
+    free(args[i]);
+  free(args);
+}
+
+static int project_args_apply(const char *proj_path, int lineno,
+                              const char *project_dir, char **args, int count,
+                              ProjectArgState *state)
+{
+  if (!state)
+    return -1;
+
+  const char *pending_output = NULL;
+  for (int i = 0; i < count; ++i)
+  {
+    const char *arg = args[i];
+    if (!arg || !*arg)
+      continue;
+    if (strcmp(arg, "-o") == 0)
+    {
+      if (i + 1 >= count)
+      {
+        fprintf(stderr, "error: -o expects a path in '%s' (line %d)\n", proj_path, lineno);
+        return -1;
+      }
+      const char *dest = args[++i];
+      if (!dest || !*dest)
+      {
+        fprintf(stderr, "error: -o expects a path in '%s' (line %d)\n", proj_path, lineno);
+        return -1;
+      }
+      char resolved[1024];
+      resolve_project_relative_path(resolved, sizeof(resolved), project_dir, dest);
+      if (pending_output)
+        free((char *)pending_output);
+      pending_output = xstrdup(resolved);
+      continue;
+    }
+    if (strcmp(arg, "-S") == 0)
+    {
+      if (state->stop_after_asm)
+        *state->stop_after_asm = 1;
+      continue;
+    }
+    if (strcmp(arg, "-Sccb") == 0)
+    {
+      if (state->stop_after_ccb)
+        *state->stop_after_ccb = 1;
+      continue;
+    }
+    if (strcmp(arg, "-g") == 0)
+    {
+      if (state->debug_symbols)
+        *state->debug_symbols = 1;
+      continue;
+    }
+    if (strcmp(arg, "--strip") == 0)
+    {
+      if (state->strip_metadata)
+        *state->strip_metadata = 1;
+      continue;
+    }
+    if (strcmp(arg, "--strip-hard") == 0)
+    {
+      if (state->strip_metadata)
+        *state->strip_metadata = 1;
+      if (state->strip_hard)
+        *state->strip_hard = 1;
+      continue;
+    }
+    if (strcmp(arg, "--obfuscate") == 0)
+    {
+      if (state->strip_metadata)
+        *state->strip_metadata = 1;
+      if (state->strip_hard)
+        *state->strip_hard = 1;
+      if (state->obfuscate)
+        *state->obfuscate = 1;
+      continue;
+    }
+    if (strncmp(arg, "-O", 2) == 0)
+    {
+      const char *level_str = arg + 2;
+      int level = 1;
+      if (*level_str != '\0')
+      {
+        char *endptr = NULL;
+        long parsed = strtol(level_str, &endptr, 10);
+        if (!endptr || *endptr != '\0' || parsed < 0 || parsed > 3)
+        {
+          fprintf(stderr,
+                  "invalid optimization level '%s' in '%s' (line %d)\n",
+                  arg, proj_path, lineno);
+          return -1;
+        }
+        level = (int)parsed;
+      }
+      if (state->opt_level)
+        *state->opt_level = level;
+      continue;
+    }
+    if (strcmp(arg, "--no-link") == 0)
+    {
+      if (state->no_link)
+        *state->no_link = 1;
+      if (i + 1 < count && args[i + 1][0] != '-')
+      {
+        const char *cand = args[i + 1];
+        if (is_object_file_arg(cand))
+        {
+          if (state->obj_override)
+            *state->obj_override = xstrdup(cand);
+          i++;
+        }
+      }
+      continue;
+    }
+    if (strcmp(arg, "-c") == 0)
+    {
+      if (state->no_link)
+        *state->no_link = 1;
+      if (i + 1 < count && args[i + 1][0] != '-')
+      {
+        const char *cand = args[i + 1];
+        if (is_object_file_arg(cand))
+        {
+          if (state->obj_override)
+            *state->obj_override = xstrdup(cand);
+          i++;
+        }
+        else if (is_ce_source_arg(cand))
+        {
+          fprintf(stderr,
+                  "error: -c in project args cannot list .ce inputs; use ce= instead (line %d)\n",
+                  lineno);
+          return -1;
+        }
+      }
+      continue;
+    }
+    if (strcmp(arg, "--asm-syntax") == 0)
+    {
+      if (i + 1 >= count)
+      {
+        fprintf(stderr, "error: --asm-syntax expects a value in '%s' (line %d)\n",
+                proj_path, lineno);
+        return -1;
+      }
+      const char *val = args[++i];
+      if (state->asm_syntax)
+      {
+        if (strcmp(val, "intel") == 0)
+          *state->asm_syntax = ASM_INTEL;
+        else if (strcmp(val, "att") == 0)
+          *state->asm_syntax = ASM_ATT;
+        else if (strcmp(val, "nasm") == 0)
+          *state->asm_syntax = ASM_NASM;
+        else
+        {
+          fprintf(stderr, "Unknown asm syntax '%s' in '%s' (line %d)\n",
+                  val, proj_path, lineno);
+          return -1;
+        }
+      }
+      continue;
+    }
+    if (strcmp(arg, "--chancecodec") == 0)
+    {
+      if (i + 1 >= count)
+      {
+        fprintf(stderr, "error: --chancecodec expects a path in '%s' (line %d)\n",
+                proj_path, lineno);
+        return -1;
+      }
+      if (state->chancecodec_cmd_override)
+        *state->chancecodec_cmd_override = xstrdup(args[++i]);
+      else
+        i++;
+      continue;
+    }
+    if (strcmp(arg, "--cc") == 0)
+    {
+      if (i + 1 >= count)
+      {
+        fprintf(stderr, "error: --cc expects a path in '%s' (line %d)\n",
+                proj_path, lineno);
+        return -1;
+      }
+      if (state->host_cc_cmd_override)
+        *state->host_cc_cmd_override = xstrdup(args[++i]);
+      else
+        i++;
+      continue;
+    }
+    if (strcmp(arg, "--library") == 0)
+    {
+      if (state->emit_library)
+        *state->emit_library = 1;
+      continue;
+    }
+    if (strcmp(arg, "--freestanding") == 0)
+    {
+      if (state->freestanding)
+        *state->freestanding = 1;
+      if (state->freestanding_requested)
+        *state->freestanding_requested = 1;
+      continue;
+    }
+    if (strcmp(arg, "-x86") == 0)
+    {
+      if (state->target_arch)
+        *state->target_arch = ARCH_X86;
+      if (state->chancecode_backend)
+        *state->chancecode_backend = "x86-gas";
+      continue;
+    }
+    if (strcmp(arg, "-arm64") == 0)
+    {
+      if (state->target_arch)
+        *state->target_arch = ARCH_ARM64;
+      if (state->chancecode_backend)
+        *state->chancecode_backend = NULL;
+      continue;
+    }
+    if (strcmp(arg, "-bslash") == 0)
+    {
+      if (state->target_arch)
+        *state->target_arch = ARCH_BSLASH;
+      if (state->chancecode_backend)
+        *state->chancecode_backend = "bslash";
+      if (state->stop_after_asm)
+        *state->stop_after_asm = 1;
+      continue;
+    }
+    if (strcmp(arg, "-m32") == 0)
+    {
+      if (state->m32)
+        *state->m32 = 1;
+      continue;
+    }
+    if (strcmp(arg, "-m64") == 0)
+    {
+      if (state->m32)
+        *state->m32 = 0;
+      continue;
+    }
+    if (strcmp(arg, "--target-os") == 0)
+    {
+      if (i + 1 >= count)
+      {
+        fprintf(stderr, "error: --target-os expects a value in '%s' (line %d)\n",
+                proj_path, lineno);
+        return -1;
+      }
+      const char *os = args[++i];
+      if (state->target_os)
+      {
+        if (strcmp(os, "windows") == 0)
+          *state->target_os = OS_WINDOWS;
+        else if (strcmp(os, "linux") == 0)
+          *state->target_os = OS_LINUX;
+        else if (strcmp(os, "macos") == 0)
+          *state->target_os = OS_MACOS;
+        else
+        {
+          fprintf(stderr,
+                  "Unknown --target-os '%s' in '%s' (line %d)\n",
+                  os, proj_path, lineno);
+          return -1;
+        }
+      }
+      continue;
+    }
+    if (strcmp(arg, "-I") == 0)
+    {
+      if (i + 1 >= count)
+      {
+        fprintf(stderr, "error: -I expects a directory in '%s' (line %d)\n",
+                proj_path, lineno);
+        return -1;
+      }
+      char resolved[1024];
+      resolve_project_relative_path(resolved, sizeof(resolved), project_dir,
+                                    args[++i]);
+      chance_add_include_dir(state->include_dirs, state->include_dir_count,
+                             resolved);
+      continue;
+    }
+    if (strcmp(arg, "-Nno-formatting") == 0)
+    {
+      parser_set_disable_formatting_notes(1);
+      continue;
+    }
+    if (strcmp(arg, "-vd") == 0 || strcmp(arg, "--verbose-deep") == 0)
+    {
+      compiler_verbose_set_mode(1);
+      compiler_verbose_set_deep(1);
+      continue;
+    }
+    if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0)
+    {
+      compiler_verbose_set_mode(1);
+      continue;
+    }
+    if (strcmp(arg, "--no-ansi") == 0)
+    {
+      diag_set_use_ansi(0);
+      verbose_use_ansi = 0;
+      compiler_verbose_set_use_ansi(0);
+      continue;
+    }
+    if (strncmp(arg, "-sr:", 4) == 0)
+    {
+      const char *sr_path = arg + 4;
+      if (!sr_path || !*sr_path)
+      {
+        fprintf(stderr,
+                "error: -sr: requires a .ce or .cclib path in '%s' (line %d)\n",
+                proj_path, lineno);
+        return -1;
+      }
+      char resolved[1024];
+      resolve_project_relative_path(resolved, sizeof(resolved), project_dir,
+                                    sr_path);
+      if (ends_with_icase(sr_path, ".ce"))
+      {
+        if (push_input_entry(resolved, state->symbol_ref_ce_list, 1) != 0)
+          return -1;
+      }
+      else if (ends_with_icase(sr_path, ".cclib"))
+      {
+        if (push_input_entry(resolved, state->symbol_ref_cclib_list, 1) != 0)
+          return -1;
+      }
+      else
+      {
+        fprintf(stderr,
+                "error: -sr: path '%s' must be a .ce or .cclib file (line %d)\n",
+                sr_path, lineno);
+        return -1;
+      }
+      continue;
+    }
+    if (strcmp(arg, "--implicit-voidp") == 0)
+    {
+      if (state->implicit_voidp)
+        *state->implicit_voidp = 1;
+      continue;
+    }
+    if (strcmp(arg, "--implicit-sizeof") == 0)
+    {
+      if (state->implicit_sizeof)
+        *state->implicit_sizeof = 1;
+      continue;
+    }
+    if (arg[0] == '-')
+    {
+      fprintf(stderr,
+              "error: unknown project arg '%s' in '%s' (line %d)\n",
+              arg, proj_path, lineno);
+      return -1;
+    }
+    fprintf(stderr,
+            "error: unexpected token '%s' in project args for '%s' (line %d)\n",
+            arg, proj_path, lineno);
+    return -1;
+  }
+
+  if (pending_output)
+  {
+    if (state->output_overridden)
+      *state->output_overridden = 1;
+    if (state->project_output_alloc && state->out)
+    {
+      if (*state->project_output_alloc)
+        free(*state->project_output_alloc);
+      *state->project_output_alloc = (char *)pending_output;
+      if (state->no_link && *state->no_link && state->obj_override)
+        *state->obj_override = *state->project_output_alloc;
+      else
+        *state->out = *state->project_output_alloc;
+    }
+    else
+    {
+      free((char *)pending_output);
+    }
+  }
+  return 0;
+}
+
 static int parse_ceproj_file(
     const char *proj_path, ProjectInputList ce_list, ProjectInputList ccb_list,
     ProjectInputList cclib_list, ProjectInputList obj_list,
     char ***include_dirs, int *include_dir_count, int *output_overridden,
     const char **out, char **project_output_alloc, TargetArch *target_arch,
     const char **chancecode_backend, int *stop_after_ccb, int *stop_after_asm,
-    int *emit_library, int *no_link, int *freestanding, TargetOS *target_os)
+  int *emit_library, int *no_link, int *freestanding, TargetOS *target_os,
+  int *freestanding_requested, int *m32, int *opt_level, int *debug_symbols,
+  int *strip_metadata, int *strip_hard, int *obfuscate,
+  AsmSyntax *asm_syntax, const char **chancecodec_cmd_override,
+  const char **host_cc_cmd_override, const char **obj_override,
+  int *implicit_voidp, int *implicit_sizeof,
+  ProjectInputList symbol_ref_ce_list,
+  ProjectInputList symbol_ref_cclib_list, char **after_cmd)
 {
   FILE *f = fopen(proj_path, "rb");
   if (!f)
@@ -1206,6 +1871,83 @@ static int parse_ceproj_file(
         if (emit_library)
           *emit_library = 1;
       }
+      else if (equals_icase(value_buf, "object") || equals_icase(value_buf, "obj"))
+      {
+        if (no_link)
+          *no_link = 1;
+      }
+    }
+    else if (strcmp(key, "after") == 0)
+    {
+      if (after_cmd)
+      {
+        char block[4096];
+        if (parse_project_block_value(f, &lineno, value_buf, block, sizeof(block)) != 0)
+        {
+          fprintf(stderr, "error: unterminated after block in '%s' (line %d)\n",
+                  proj_path, lineno);
+          rc = -1;
+          break;
+        }
+        if (*after_cmd)
+        {
+          free(*after_cmd);
+          *after_cmd = NULL;
+        }
+        trim_whitespace_inplace(block);
+        *after_cmd = block[0] ? xstrdup(block) : NULL;
+      }
+    }
+    else if (strcmp(key, "args") == 0 || strcmp(key, "control_args") == 0 ||
+             strcmp(key, "control-args") == 0)
+    {
+      ProjectArgState state = {
+          .out = out,
+          .project_output_alloc = project_output_alloc,
+          .output_overridden = output_overridden,
+          .stop_after_ccb = stop_after_ccb,
+          .stop_after_asm = stop_after_asm,
+          .no_link = no_link,
+          .emit_library = emit_library,
+          .freestanding = freestanding,
+          .freestanding_requested = freestanding_requested,
+          .m32 = m32,
+          .opt_level = opt_level,
+          .debug_symbols = debug_symbols,
+          .strip_metadata = strip_metadata,
+          .strip_hard = strip_hard,
+          .obfuscate = obfuscate,
+          .asm_syntax = asm_syntax,
+          .target_arch = target_arch,
+          .chancecode_backend = chancecode_backend,
+          .chancecodec_cmd_override = chancecodec_cmd_override,
+          .host_cc_cmd_override = host_cc_cmd_override,
+          .target_os = target_os,
+          .include_dirs = include_dirs,
+          .include_dir_count = include_dir_count,
+          .obj_override = obj_override,
+          .implicit_voidp = implicit_voidp,
+          .implicit_sizeof = implicit_sizeof,
+          .symbol_ref_ce_list = symbol_ref_ce_list,
+          .symbol_ref_cclib_list = symbol_ref_cclib_list};
+
+      char **args = NULL;
+      int arg_count = 0;
+      if (project_args_tokenize(value_buf, &args, &arg_count) != 0)
+      {
+        fprintf(stderr, "error: failed to parse args in '%s' (line %d)\n",
+                proj_path, lineno);
+        rc = -1;
+        break;
+      }
+      if (project_args_apply(proj_path, lineno, project_dir, args, arg_count,
+                             &state) != 0)
+      {
+        project_args_free(args, arg_count);
+        rc = -1;
+        break;
+      }
+      project_args_free(args, arg_count);
     }
     else if (strcmp(key, "stop_after") == 0 ||
              strcmp(key, "stopafter") == 0)
@@ -1286,6 +2028,12 @@ static int parse_ceproj_file(
     }
   }
   fclose(f);
+  if (no_link && *no_link && output_overridden && *output_overridden &&
+      obj_override && out && *out)
+  {
+    if (!*obj_override)
+      *obj_override = *out;
+  }
   return rc;
 }
 
@@ -1360,6 +2108,16 @@ static int write_text_file(const char *path, const char *content)
   }
   fclose(f);
   return 0;
+}
+
+static const char *derive_module_name_from_path(const char *path, char *buffer, size_t bufsz)
+{
+  if (!path || !buffer || bufsz == 0)
+    return NULL;
+  split_path(path, NULL, 0, buffer, bufsz);
+  if (!buffer[0])
+    return NULL;
+  return buffer;
 }
 
 typedef struct
@@ -2226,6 +2984,14 @@ static char *type_to_spec(Type *ty)
     free(inner);
     return res;
   }
+  case TY_ARRAY:
+  {
+    char *inner = type_to_spec(ty->array.elem);
+    int length = ty->array.is_unsized ? -1 : ty->array.length;
+    char *res = format_string("arr(%d,%s)", length, inner ? inner : "void");
+    free(inner);
+    return res;
+  }
   case TY_STRUCT:
   {
     const char *module = module_registry_find_struct_module(ty);
@@ -2291,6 +3057,48 @@ static Type *spec_to_type(const char *spec)
     Type *inner_type = spec_to_type(inner);
     free(inner);
     return type_ptr(inner_type);
+  }
+
+  if (strncmp(spec, "arr(", 4) == 0)
+  {
+    size_t len = strlen(spec);
+    if (len < 7 || spec[len - 1] != ')')
+      return &builtin_ty_void;
+    const char *inner = spec + 4;
+    const char *end = spec + len - 1;
+    int depth = 0;
+    const char *comma = NULL;
+    for (const char *p = inner; p < end; ++p)
+    {
+      if (*p == '(')
+        depth++;
+      else if (*p == ')')
+        depth--;
+      else if (*p == ',' && depth == 0)
+      {
+        comma = p;
+        break;
+      }
+    }
+    if (!comma)
+      return &builtin_ty_void;
+    size_t len_len = (size_t)(comma - inner);
+    char *len_text = (char *)xmalloc(len_len + 1);
+    memcpy(len_text, inner, len_len);
+    len_text[len_len] = '\0';
+    char *endptr = NULL;
+    long length = strtol(len_text, &endptr, 10);
+    free(len_text);
+    if (!endptr || *endptr != '\0')
+      return &builtin_ty_void;
+    const char *inner_spec = comma + 1;
+    size_t inner_len = (size_t)(end - inner_spec);
+    char *inner_text = (char *)xmalloc(inner_len + 1);
+    memcpy(inner_text, inner_spec, inner_len);
+    inner_text[inner_len] = '\0';
+    Type *inner_type = spec_to_type(inner_text);
+    free(inner_text);
+    return type_array(inner_type, (int)length);
   }
 
   if (strncmp(spec, "struct(", 7) == 0 || strncmp(spec, "import(", 7) == 0)
@@ -2752,6 +3560,7 @@ static int collect_enums_for_module(const char *module_name,
 }
 
 static int collect_metadata_for_unit(const Node *unit, const char *ccb_path,
+                                     const char *fallback_module_name,
                                      LibraryModuleData **modules,
                                      int *module_count, int *module_cap)
 {
@@ -2759,6 +3568,8 @@ static int collect_metadata_for_unit(const Node *unit, const char *ccb_path,
       !module_cap)
     return 0;
   const char *module_name = unit->module_path.full_name;
+  if (!module_name || !*module_name)
+    module_name = fallback_module_name;
   if (!module_name || !*module_name)
     return 0;
   LibraryModuleData *mod =
@@ -2800,15 +3611,19 @@ static int write_library_file(const char *path, LibraryModuleData *mods,
     CclibModule *dst = &modules[i];
     dst->module_name = src->module_name;
 
-    if (!src->ccbin_data)
+    int needs_ccbin = (src->function_count > 0) || (src->global_count > 0);
+    if (needs_ccbin)
     {
-      err = EINVAL;
-      break;
-    }
-    if (src->ccbin_size > UINT32_MAX)
-    {
-      err = ERANGE;
-      break;
+      if (!src->ccbin_data || src->ccbin_size == 0)
+      {
+        err = EINVAL;
+        break;
+      }
+      if (src->ccbin_size > UINT32_MAX)
+      {
+        err = ERANGE;
+        break;
+      }
     }
 
     if (src->function_count > 0)
@@ -2918,8 +3733,8 @@ static int write_library_file(const char *path, LibraryModuleData *mods,
     dst->global_count =
         (uint32_t)(src->global_count < 0 ? 0 : src->global_count);
 
-    dst->ccbin_data = src->ccbin_data;
-    dst->ccbin_size = (uint32_t)src->ccbin_size;
+    dst->ccbin_data = needs_ccbin ? src->ccbin_data : NULL;
+    dst->ccbin_size = needs_ccbin ? (uint32_t)src->ccbin_size : 0u;
   }
 
   if (!err)
@@ -3765,6 +4580,11 @@ static int is_relocatable_obj(const char *path)
 
 int main(int argc, char **argv)
 {
+  if (argc == 1)
+  {
+    usage(argv[0]);
+    return 0;
+  }
   if (argc >= 2 && equals_icase(argv[1], "new"))
     return handle_new_command(argc - 1, argv + 1);
 #ifdef _WIN32
@@ -3786,6 +4606,8 @@ int main(int argc, char **argv)
   int strip_metadata = 0;
   int strip_hard = 0;
   int obfuscate = 0;
+  int implicit_voidp = 0;
+  int implicit_sizeof = 0;
   char strip_map_path[STRIP_MAP_PATH_MAX] = {0};
   int strip_map_ready = 0;
   int pending_ce_output_index = -1;
@@ -3841,6 +4663,7 @@ int main(int argc, char **argv)
   int loaded_library_function_count = 0;
   int loaded_library_function_cap = 0;
   char *project_output_alloc = NULL;
+  char *project_after_cmd = NULL;
 
   ProjectInputList ce_cli_list = {&ce_inputs, &ce_count, &ce_cap,
                                   &owned_ce_inputs, &owned_ce_count,
@@ -3856,7 +4679,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[i], "--version") == 0)
     {
       printf("chancec: CHance Compiler version 1.0.0\n");
-      printf("chancec: CE language standard: H25-1\n");
+      printf("chancec: CE language standard: H26\n");
       printf("chancec: License: OpenAzure License\n");
       printf("chancec: Compiled on %s %s\n", __DATE__, __TIME__);
       printf("chancec: Created by Nathan Hornby (AzureianGH)\n");
@@ -4101,6 +4924,16 @@ int main(int argc, char **argv)
       compiler_verbose_set_use_ansi(0);
       continue;
     }
+    if (strcmp(argv[i], "--implicit-voidp") == 0)
+    {
+      implicit_voidp = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--implicit-sizeof") == 0)
+    {
+      implicit_sizeof = 1;
+      continue;
+    }
     if (strncmp(argv[i], "-sr:", 4) == 0)
     {
       const char *sr_path = argv[i] + 4;
@@ -4171,7 +5004,19 @@ int main(int argc, char **argv)
           arg, ce_list, ccb_list, cclib_list, obj_list, &include_dirs,
           &include_dir_count, &output_overridden, &out, &project_output_alloc,
           &target_arch, &chancecode_backend, &stop_after_ccb, &stop_after_asm,
-          &emit_library, &no_link, &freestanding, &target_os);
+          &emit_library, &no_link, &freestanding, &target_os,
+          &freestanding_requested, &m32, &opt_level, &debug_symbols,
+          &strip_metadata, &strip_hard, &obfuscate, &asm_syntax,
+          &chancecodec_cmd_override, &host_cc_cmd_override, &obj_override,
+          &implicit_voidp, &implicit_sizeof,
+          (ProjectInputList){&symbol_ref_ce_inputs, &symbol_ref_ce_count,
+                   &symbol_ref_ce_cap, &owned_ce_inputs,
+                   &owned_ce_count, &owned_ce_cap, NULL},
+          (ProjectInputList){&symbol_ref_cclib_inputs,
+                   &symbol_ref_cclib_count,
+                             &symbol_ref_cclib_cap, &owned_cclib_inputs,
+                             &owned_cclib_count, &owned_cclib_cap, NULL},
+          &project_after_cmd);
       if (perr != 0)
         return 2;
       if (!freestanding_requested && !freestanding_before && freestanding)
@@ -4369,41 +5214,8 @@ int main(int argc, char **argv)
   if (!freestanding_requested)
   {
     char stdlib_path[1024];
-    if (exe_dir[0])
-      snprintf(stdlib_path, sizeof(stdlib_path), "%s%cstdlib%cstdlib.cclib",
-               exe_dir, CHANCE_PATH_SEP, CHANCE_PATH_SEP);
-    else
-      stdlib_path[0] = '\0';
-
-    if (!stdlib_path[0] || !is_regular_file(stdlib_path))
-    {
-      const char *path_env = getenv("PATH");
-      if (path_env)
-      {
-        const char *p = path_env;
-        while (*p)
-        {
-          const char *s = p;
-          while (*p && *p != ':')
-            p++;
-          size_t seg_len = (size_t)(p - s);
-          if (seg_len > 0)
-          {
-            char candidate[1024];
-            if (snprintf(candidate, sizeof(candidate), "%.*s/stdlib/stdlib.cclib", (int)seg_len, s) > 0)
-            {
-              if (is_regular_file(candidate))
-              {
-                snprintf(stdlib_path, sizeof(stdlib_path), "%s", candidate);
-                break;
-              }
-            }
-          }
-          if (*p)
-            p++;
-        }
-      }
-    }
+    (void)locate_cclib_path(exe_dir, "stdlib", "stdlib.cclib",
+                            stdlib_path, sizeof(stdlib_path));
 
     if (stdlib_path[0] && is_regular_file(stdlib_path))
     {
@@ -4419,6 +5231,28 @@ int main(int argc, char **argv)
       fprintf(stderr,
               "warning: stdlib not found at '%s'; enabling freestanding (--nostdlib)\n",
               stdlib_path[0] ? stdlib_path : "<unknown>");
+    }
+  }
+
+  {
+    char runtime_path[1024];
+    (void)locate_cclib_path(exe_dir, "runtime", "runtime.cclib",
+                            runtime_path, sizeof(runtime_path));
+
+    if (runtime_path[0] && is_regular_file(runtime_path))
+    {
+      ProjectInputList cclib_list = {&cclib_inputs, &cclib_count, &cclib_cap,
+                                     &owned_cclib_inputs, &owned_cclib_count,
+                                     &owned_cclib_cap, NULL};
+      if (push_input_entry(runtime_path, cclib_list, 1) != 0)
+        goto fail;
+    }
+    else
+    {
+      fprintf(stderr,
+              "error: runtime.cclib not found at '%s'\n",
+              runtime_path[0] ? runtime_path : "<unknown>");
+      goto fail;
     }
   }
 
@@ -4553,6 +5387,8 @@ int main(int argc, char **argv)
       }
     }
   }
+  sema_set_allow_implicit_voidp(implicit_voidp);
+  sema_set_allow_implicit_sizeof(implicit_sizeof);
 
   module_registry_reset();
   if (strip_hard)
@@ -4916,7 +5752,14 @@ int main(int argc, char **argv)
 
       if (!rc && emit_library)
       {
-        if (collect_metadata_for_unit(unit, ccb_path, &library_modules,
+        char module_name_buf[256];
+        const char *fallback_name = derive_module_name_from_path(
+            ccb_path, module_name_buf, sizeof(module_name_buf));
+        const char *module_name = unit->module_path.full_name;
+        const char *effective_module =
+            (module_name && *module_name) ? module_name : fallback_name;
+        if (collect_metadata_for_unit(unit, ccb_path, effective_module,
+                                      &library_modules,
                                       &library_module_count,
                                       &library_module_cap))
         {
@@ -4924,15 +5767,27 @@ int main(int argc, char **argv)
         }
         else
         {
-          const char *module_name = unit->module_path.full_name;
           LibraryModuleData *libmod =
-              module_name
+              effective_module
                   ? find_or_add_module(&library_modules, &library_module_count,
-                                       &library_module_cap, module_name)
+                           &library_module_cap, effective_module)
                   : NULL;
           if (!libmod)
           {
             rc = 1;
+          }
+          else if (libmod->function_count == 0 && libmod->global_count == 0)
+          {
+            if (libmod->ccbin_data)
+              free(libmod->ccbin_data);
+            libmod->ccbin_data = NULL;
+            libmod->ccbin_size = 0;
+            if (libmod->ccbin_path)
+            {
+              free(libmod->ccbin_path);
+              libmod->ccbin_path = NULL;
+            }
+            remove(ccb_path);
           }
           else
           {
@@ -5911,6 +6766,12 @@ int main(int argc, char **argv)
     to_cap = 0;
   }
 cleanup:
+  if (!rc && project_after_cmd && project_after_cmd[0])
+  {
+    int after_rc = system(project_after_cmd);
+    if (after_rc != 0)
+      fprintf(stderr, "warning: after command failed (rc=%d): %s\n", after_rc, project_after_cmd);
+  }
   if (temp_objs)
   {
     for (int i = 0; i < to_cnt; ++i)
@@ -6004,6 +6865,8 @@ cleanup:
   }
   if (project_output_alloc)
     free(project_output_alloc);
+  if (project_after_cmd)
+    free(project_after_cmd);
   free((void *)ce_inputs);
   free((void *)ccb_inputs);
   free((void *)cclib_inputs);
