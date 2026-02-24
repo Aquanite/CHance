@@ -1056,7 +1056,8 @@ static void strip_utf8_bom(char *text)
 }
 
 static int locate_cclib_path(const char *exe_dir, const char *subdir,
-                             const char *filename, char *out, size_t outsz)
+                             const char *filename, const char *default_path,
+                             char *out, size_t outsz)
 {
   if (!out || outsz == 0 || !subdir || !filename)
     return 0;
@@ -1076,7 +1077,13 @@ static int locate_cclib_path(const char *exe_dir, const char *subdir,
       if (is_regular_file(out))
         return 1;
     }
-    return 0;
+  }
+
+  if (default_path && default_path[0])
+  {
+    snprintf(out, outsz, "%s", default_path);
+    if (is_regular_file(out))
+      return 1;
   }
 
   const char *home_env = getenv("CHANCE_HOME");
@@ -5236,14 +5243,22 @@ int main(int argc, char **argv)
     }
   }
 
+#ifndef DEFAULT_STDLIB
+#define DEFAULT_STDLIB ""
+#endif
+#ifndef DEFAULT_RUNTIME
+#define DEFAULT_RUNTIME ""
+#endif
+
   if (!freestanding_requested)
   {
     char stdlib_path[1024];
-    if (!locate_cclib_path(exe_dir, "stdlib", "stdlib.cclib",
+    if (!locate_cclib_path(exe_dir, "stdlib", "stdlib.cclib", DEFAULT_STDLIB,
                            stdlib_path, sizeof(stdlib_path)))
     {
       (void)locate_cclib_path(exe_dir, "src/stdlib", "stdlib.cclib",
-                              stdlib_path, sizeof(stdlib_path));
+                              DEFAULT_STDLIB, stdlib_path,
+                              sizeof(stdlib_path));
     }
 
     if (stdlib_path[0] && is_regular_file(stdlib_path))
@@ -5266,10 +5281,12 @@ int main(int argc, char **argv)
   {
     char runtime_path[1024];
     if (!locate_cclib_path(exe_dir, "runtime", "runtime.cclib",
-                           runtime_path, sizeof(runtime_path)))
+                           DEFAULT_RUNTIME, runtime_path,
+                           sizeof(runtime_path)))
     {
       (void)locate_cclib_path(exe_dir, "stdlib", "runtime.cclib",
-                              runtime_path, sizeof(runtime_path));
+                              DEFAULT_RUNTIME, runtime_path,
+                              sizeof(runtime_path));
     }
 
     if (runtime_path[0] && is_regular_file(runtime_path))

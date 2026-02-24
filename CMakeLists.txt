@@ -34,6 +34,15 @@ add_executable(chancec
 
 target_link_libraries(chancec PRIVATE chance_core)
 
+set(CHANCE_DEFAULT_RUNTIME "" CACHE STRING "Default runtime.cclib path")
+set(CHANCE_DEFAULT_STDLIB "" CACHE STRING "Default stdlib.cclib path")
+if(CHANCE_DEFAULT_RUNTIME)
+    target_compile_definitions(chancec PRIVATE DEFAULT_RUNTIME=\"${CHANCE_DEFAULT_RUNTIME}\")
+endif()
+if(CHANCE_DEFAULT_STDLIB)
+    target_compile_definitions(chancec PRIVATE DEFAULT_STDLIB=\"${CHANCE_DEFAULT_STDLIB}\")
+endif()
+
 include(GNUInstallDirs)
 install(TARGETS chancec RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
