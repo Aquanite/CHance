@@ -588,7 +588,15 @@ static int get_executable_dir(char *dir, size_t dirsz, const char *argv0)
         }
         else
         {
-          resolved[0] = '\0';
+          if (_NSGetExecutablePath(dyn, &size) == 0)
+          {
+            strncpy(resolved, dyn, sizeof(resolved) - 1);
+            resolved[sizeof(resolved) - 1] = '\0';
+          }
+          else
+          {
+            resolved[0] = '\0';
+          }
         }
         free(dyn);
       }
@@ -600,11 +608,22 @@ static int get_executable_dir(char *dir, size_t dirsz, const char *argv0)
     else
     {
       if (!realpath(resolved, resolved))
-        resolved[0] = '\0';
+      {
+        // Keep the unresolved path; it is still useful for locating siblings.
+      }
     }
 #else
     resolved[0] = '\0';
 #endif
+  }
+
+  if (!resolved[0] && argv0 && *argv0)
+  {
+    if (strchr(argv0, '/') || strchr(argv0, '\\'))
+    {
+      strncpy(resolved, argv0, sizeof(resolved) - 1);
+      resolved[sizeof(resolved) - 1] = '\0';
+    }
   }
 
   if (!resolved[0] && argv0 && *argv0)
@@ -622,10 +641,17 @@ static int get_executable_dir(char *dir, size_t dirsz, const char *argv0)
         if (seg_len > 0)
         {
           char candidate[PATH_MAX];
-          if (snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)seg_len, s, argv0) > 0)
+          if (snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)seg_len, s,
+                       argv0) > 0)
           {
-            if (access(candidate, X_OK) == 0 && realpath(candidate, resolved))
+            if (access(candidate, X_OK) == 0)
+            {
+              if (realpath(candidate, resolved))
+                break;
+              strncpy(resolved, candidate, sizeof(resolved) - 1);
+              resolved[sizeof(resolved) - 1] = '\0';
               break;
+            }
           }
         }
         if (*p)
@@ -1050,7 +1076,6 @@ static int locate_cclib_path(const char *exe_dir, const char *subdir,
       if (is_regular_file(out))
         return 1;
     }
-    out[0] = '\0';
     return 0;
   }
 
@@ -5214,8 +5239,12 @@ int main(int argc, char **argv)
   if (!freestanding_requested)
   {
     char stdlib_path[1024];
-    (void)locate_cclib_path(exe_dir, "stdlib", "stdlib.cclib",
-                            stdlib_path, sizeof(stdlib_path));
+    if (!locate_cclib_path(exe_dir, "stdlib", "stdlib.cclib",
+                           stdlib_path, sizeof(stdlib_path)))
+    {
+      (void)locate_cclib_path(exe_dir, "src/stdlib", "stdlib.cclib",
+                              stdlib_path, sizeof(stdlib_path));
+    }
 
     if (stdlib_path[0] && is_regular_file(stdlib_path))
     {
@@ -5236,8 +5265,12 @@ int main(int argc, char **argv)
 
   {
     char runtime_path[1024];
-    (void)locate_cclib_path(exe_dir, "runtime", "runtime.cclib",
-                            runtime_path, sizeof(runtime_path));
+    if (!locate_cclib_path(exe_dir, "runtime", "runtime.cclib",
+                           runtime_path, sizeof(runtime_path)))
+    {
+      (void)locate_cclib_path(exe_dir, "stdlib", "runtime.cclib",
+                              runtime_path, sizeof(runtime_path));
+    }
 
     if (runtime_path[0] && is_regular_file(runtime_path))
     {
