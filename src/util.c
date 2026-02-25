@@ -14,10 +14,16 @@
 #define ANSI_BOLD_MAGENTA "\x1b[1;35m"
 
 static int diag_use_ansi = 1;
+static int diag_data_log = 0;
 
 void diag_set_use_ansi(int enable)
 {
     diag_use_ansi = enable ? 1 : 0;
+}
+
+void diag_set_data_log(int enable)
+{
+    diag_data_log = enable ? 1 : 0;
 }
 
 typedef struct
@@ -135,6 +141,83 @@ static const char *diag_color_for(const char *sev)
     if (strcmp(sev, "note") == 0)
         return ANSI_BOLD_CYAN;
     return ANSI_BOLD_WHITE;
+}
+
+static void diag_json_write_string(FILE *out, const char *value)
+{
+    fputc('"', out);
+    if (value)
+    {
+        const unsigned char *p = (const unsigned char *)value;
+        while (*p)
+        {
+            unsigned char ch = *p++;
+            switch (ch)
+            {
+            case '"':
+                fputs("\\\"", out);
+                break;
+            case '\\':
+                fputs("\\\\", out);
+                break;
+            case '\n':
+                fputs("\\n", out);
+                break;
+            case '\r':
+                fputs("\\r", out);
+                break;
+            case '\t':
+                fputs("\\t", out);
+                break;
+            default:
+                if (ch < 0x20)
+                    fprintf(out, "\\u%04x", (unsigned int)ch);
+                else
+                    fputc((int)ch, out);
+                break;
+            }
+        }
+    }
+    fputc('"', out);
+}
+
+static char *diag_format_message(const char *fmt, va_list ap)
+{
+    if (!fmt)
+        return NULL;
+    va_list ap_copy;
+    va_copy(ap_copy, ap);
+    int needed = vsnprintf(NULL, 0, fmt, ap_copy);
+    va_end(ap_copy);
+    if (needed < 0)
+        return NULL;
+    size_t len = (size_t)needed;
+    char *buf = (char *)malloc(len + 1);
+    if (!buf)
+        return NULL;
+    va_list ap_copy2;
+    va_copy(ap_copy2, ap);
+    vsnprintf(buf, len + 1, fmt, ap_copy2);
+    va_end(ap_copy2);
+    return buf;
+}
+
+static void diag_emit_data_log(const char *sev, const SourceBuffer *src,
+                               int line, int col, const char *message)
+{
+    int safe_line = line > 0 ? line : 0;
+    int safe_col = col > 0 ? col : 0;
+    fprintf(stderr, "data-log:{\"severity\":");
+    diag_json_write_string(stderr, sev ? sev : "");
+    fprintf(stderr, ",\"file\":");
+    if (src && src->filename)
+        diag_json_write_string(stderr, src->filename);
+    else
+        fputs("null", stderr);
+    fprintf(stderr, ",\"line\":%d,\"col\":%d,\"message\":", safe_line,
+            safe_col);
+    diag_json_write_string(stderr, message ? message : "");
+    fputs("}\n", stderr);
 }
 
 void *xmalloc(size_t sz)
@@ -437,12 +520,490 @@ const char *node_kind_name(NodeKind kind)
     }
 }
 
+static void ast_json_write_string(FILE *out, const char *value)
+{
+    fputc('"', out);
+    if (value)
+    {
+        const unsigned char *p = (const unsigned char *)value;
+        while (*p)
+        {
+            unsigned char ch = *p++;
+            switch (ch)
+            {
+            case '"':
+                fputs("\\\"", out);
+                break;
+            case '\\':
+                fputs("\\\\", out);
+                break;
+            case '\n':
+                fputs("\\n", out);
+                break;
+            case '\r':
+                fputs("\\r", out);
+                break;
+            case '\t':
+                fputs("\\t", out);
+                break;
+            default:
+                if (ch < 0x20)
+                    fprintf(out, "\\u%04x", (unsigned int)ch);
+                else
+                    fputc((int)ch, out);
+                break;
+            }
+        }
+    }
+    fputc('"', out);
+}
+
+static void ast_json_write_string_len(FILE *out, const char *value, int length)
+{
+    fputc('"', out);
+    if (value && length > 0)
+    {
+        const unsigned char *p = (const unsigned char *)value;
+        int remaining = length;
+        while (remaining-- > 0)
+        {
+            unsigned char ch = *p++;
+            switch (ch)
+            {
+            case '"':
+                fputs("\\\"", out);
+                break;
+            case '\\':
+                fputs("\\\\", out);
+                break;
+            case '\n':
+                fputs("\\n", out);
+                break;
+            case '\r':
+                fputs("\\r", out);
+                break;
+            case '\t':
+                fputs("\\t", out);
+                break;
+            default:
+                if (ch < 0x20)
+                    fprintf(out, "\\u%04x", (unsigned int)ch);
+                else
+                    fputc((int)ch, out);
+                break;
+            }
+        }
+    }
+    fputc('"', out);
+}
+
+static const char *type_kind_name(TypeKind kind)
+{
+    switch (kind)
+    {
+    case TY_I8:
+        return "i8";
+    case TY_U8:
+        return "u8";
+    case TY_I16:
+        return "i16";
+    case TY_U16:
+        return "u16";
+    case TY_I32:
+        return "i32";
+    case TY_U32:
+        return "u32";
+    case TY_I64:
+        return "i64";
+    case TY_U64:
+        return "u64";
+    case TY_F32:
+        return "f32";
+    case TY_F64:
+        return "f64";
+    case TY_F128:
+        return "f128";
+    case TY_VOID:
+        return "void";
+    case TY_CHAR:
+        return "char";
+    case TY_BOOL:
+        return "bool";
+    case TY_FUNC:
+        return "func";
+    case TY_PTR:
+        return "ptr";
+    case TY_STRUCT:
+        return "struct";
+    case TY_ARRAY:
+        return "array";
+    case TY_VA_LIST:
+        return "va_list";
+    case TY_TEMPLATE_PARAM:
+        return "template_param";
+    case TY_IMPORT:
+        return "import";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *template_constraint_name(TemplateConstraintKind kind)
+{
+    switch (kind)
+    {
+    case TEMPLATE_CONSTRAINT_INTEGRAL:
+        return "integral";
+    case TEMPLATE_CONSTRAINT_FLOATING:
+        return "floating";
+    case TEMPLATE_CONSTRAINT_NUMERIC:
+        return "numeric";
+    case TEMPLATE_CONSTRAINT_POINTER:
+        return "pointer";
+    case TEMPLATE_CONSTRAINT_NONE:
+    default:
+        return "none";
+    }
+}
+
+static void ast_json_write_type(FILE *out, const Type *type, int depth)
+{
+    if (!type)
+    {
+        fputs("null", out);
+        return;
+    }
+    if (depth > 6)
+    {
+        fputs("{\"kind\":\"depth-limit\"}", out);
+        return;
+    }
+    fprintf(out, "{\"kind\":");
+    ast_json_write_string(out, type_kind_name(type->kind));
+    fprintf(out, ",\"kind_id\":%d", (int)type->kind);
+    if (type->kind == TY_PTR)
+    {
+        fprintf(out, ",\"pointee\":");
+        ast_json_write_type(out, type->pointee, depth + 1);
+    }
+    if (type->kind == TY_ARRAY)
+    {
+        fprintf(out, ",\"length\":%d,\"unsized\":%s,\"elem\":",
+                type->array.length,
+                type->array.is_unsized ? "true" : "false");
+        ast_json_write_type(out, type->array.elem, depth + 1);
+    }
+    if (type->kind == TY_FUNC)
+    {
+        fprintf(out, ",\"varargs\":%s,\"ret\":",
+                type->func.is_varargs ? "true" : "false");
+        ast_json_write_type(out, type->func.ret, depth + 1);
+        fputs(",\"params\":[", out);
+        for (int i = 0; i < type->func.param_count; ++i)
+        {
+            if (i)
+                fputc(',', out);
+            ast_json_write_type(out, type->func.params ? type->func.params[i] : NULL, depth + 1);
+        }
+        fputc(']', out);
+    }
+    if (type->kind == TY_STRUCT)
+    {
+        fprintf(out, ",\"name\":");
+        ast_json_write_string(out, type->struct_name ? type->struct_name : "");
+        fprintf(out, ",\"field_count\":%d", type->strct.field_count);
+    }
+    if (type->kind == TY_TEMPLATE_PARAM)
+    {
+        fprintf(out, ",\"param\":");
+        ast_json_write_string(out, type->template_param_name ? type->template_param_name : "");
+        fprintf(out, ",\"index\":%d,\"constraint\":", type->template_param_index);
+        ast_json_write_string(out, template_constraint_name(type->template_constraint_kind));
+        if (type->template_default_type)
+        {
+            fputs(",\"default\":", out);
+            ast_json_write_type(out, type->template_default_type, depth + 1);
+        }
+    }
+    if (type->kind == TY_IMPORT)
+    {
+        fprintf(out, ",\"module\":");
+        ast_json_write_string(out, type->import_module ? type->import_module : "");
+        fprintf(out, ",\"type_name\":");
+        ast_json_write_string(out, type->import_type_name ? type->import_type_name : "");
+    }
+    fputc('}', out);
+}
+
+static void ast_json_write_module_path(FILE *out, const ModulePath *path)
+{
+    if (!path)
+    {
+        fputs("null", out);
+        return;
+    }
+    fputs("{\"full\":", out);
+    ast_json_write_string(out, path->full_name ? path->full_name : "");
+    fputs(",\"alias\":", out);
+    ast_json_write_string(out, path->alias ? path->alias : "");
+    fputs(",\"parts\":[", out);
+    for (int i = 0; i < path->part_count; ++i)
+    {
+        if (i)
+            fputc(',', out);
+        ast_json_write_string(out, path->parts && path->parts[i] ? path->parts[i] : "");
+    }
+    fputs("]}", out);
+}
+
+static void ast_json_write_node(FILE *out, const Node *node, int depth);
+
+static void ast_json_write_node_array(FILE *out, Node **items, int count, int depth)
+{
+    fputc('[', out);
+    for (int i = 0; i < count; ++i)
+    {
+        if (i)
+            fputc(',', out);
+        ast_json_write_node(out, items ? items[i] : NULL, depth + 1);
+    }
+    fputc(']', out);
+}
+
+static void ast_json_write_node(FILE *out, const Node *node, int depth)
+{
+    if (!node)
+    {
+        fputs("null", out);
+        return;
+    }
+    if (depth > 64)
+    {
+        fputs("{\"kind\":\"depth-limit\"}", out);
+        return;
+    }
+    fputs("{\"kind\":", out);
+    ast_json_write_string(out, node_kind_name(node->kind));
+    fprintf(out, ",\"kind_id\":%d", (int)node->kind);
+    if (node->line > 0)
+        fprintf(out, ",\"line\":%d,\"col\":%d", node->line, node->col);
+    if (node->name)
+    {
+        fputs(",\"name\":", out);
+        ast_json_write_string(out, node->name);
+    }
+    if (node->call_name)
+    {
+        fputs(",\"call_name\":", out);
+        ast_json_write_string(out, node->call_name);
+    }
+    if (node->var_name)
+    {
+        fputs(",\"var_name\":", out);
+        ast_json_write_string(out, node->var_name);
+    }
+    if (node->var_ref)
+    {
+        fputs(",\"var_ref\":", out);
+        ast_json_write_string(out, node->var_ref);
+    }
+    if (node->field_name)
+    {
+        fputs(",\"field_name\":", out);
+        ast_json_write_string(out, node->field_name);
+    }
+    if (node->str_data)
+    {
+        fputs(",\"str\":", out);
+        ast_json_write_string_len(out, node->str_data, node->str_len);
+        fprintf(out, ",\"str_len\":%d", node->str_len);
+    }
+    if (node->kind == ND_INT)
+    {
+        fprintf(out, ",\"int_val\":%lld,\"int_uval\":%llu,\"unsigned\":%s,\"width\":%d",
+                (long long)node->int_val,
+                (unsigned long long)node->int_uval,
+                node->int_is_unsigned ? "true" : "false",
+                node->int_width);
+    }
+    if (node->kind == ND_FLOAT)
+    {
+        fprintf(out, ",\"float_val\":%.17g", node->float_val);
+    }
+    if (node->type)
+    {
+        fputs(",\"type\":", out);
+        ast_json_write_type(out, node->type, 0);
+    }
+    if (node->var_type)
+    {
+        fputs(",\"var_type\":", out);
+        ast_json_write_type(out, node->var_type, 0);
+    }
+    if (node->ret_type)
+    {
+        fputs(",\"ret_type\":", out);
+        ast_json_write_type(out, node->ret_type, 0);
+    }
+    if (node->generic_param_names && node->generic_param_count > 0)
+    {
+        fputs(",\"generic_params\":[", out);
+        for (int i = 0; i < node->generic_param_count; ++i)
+        {
+            if (i)
+                fputc(',', out);
+            ast_json_write_string(out, node->generic_param_names[i]);
+        }
+        fputc(']', out);
+    }
+    if (node->param_names && node->param_count > 0)
+    {
+        fputs(",\"params\":[", out);
+        for (int i = 0; i < node->param_count; ++i)
+        {
+            if (i)
+                fputc(',', out);
+            fputs("{\"name\":", out);
+            ast_json_write_string(out, node->param_names[i] ? node->param_names[i] : "");
+            if (node->param_types)
+            {
+                fputs(",\"type\":", out);
+                ast_json_write_type(out, node->param_types[i], 0);
+            }
+            if (node->param_const_flags)
+            {
+                fprintf(out, ",\"const\":%s", node->param_const_flags[i] ? "true" : "false");
+            }
+            fputc('}', out);
+        }
+        fputc(']', out);
+    }
+    if (node->call_type_args && node->call_type_arg_count > 0)
+    {
+        fputs(",\"call_type_args\":[", out);
+        for (int i = 0; i < node->call_type_arg_count; ++i)
+        {
+            if (i)
+                fputc(',', out);
+            ast_json_write_type(out, node->call_type_args[i], 0);
+        }
+        fputc(']', out);
+    }
+    if (node->is_varargs)
+        fprintf(out, ",\"is_varargs\":%s", node->is_varargs ? "true" : "false");
+    if (node->is_exposed)
+        fprintf(out, ",\"is_exposed\":%s", node->is_exposed ? "true" : "false");
+
+    if (node->lhs || node->rhs)
+    {
+        fputs(",\"lhs\":", out);
+        ast_json_write_node(out, node->lhs, depth + 1);
+        fputs(",\"rhs\":", out);
+        ast_json_write_node(out, node->rhs, depth + 1);
+    }
+    if (node->body)
+    {
+        fputs(",\"body\":", out);
+        ast_json_write_node(out, node->body, depth + 1);
+    }
+    if (node->args && node->arg_count > 0)
+    {
+        fputs(",\"args\":", out);
+        ast_json_write_node_array(out, node->args, node->arg_count, depth + 1);
+    }
+    if (node->stmts && node->stmt_count > 0)
+    {
+        fputs(",\"stmts\":", out);
+        ast_json_write_node_array(out, node->stmts, node->stmt_count, depth + 1);
+    }
+    if (node->kind == ND_SWITCH)
+    {
+        fputs(",\"switch\":{\"expr\":", out);
+        ast_json_write_node(out, node->switch_stmt.expr, depth + 1);
+        fputs(",\"cases\":[", out);
+        for (int i = 0; i < node->switch_stmt.case_count; ++i)
+        {
+            SwitchCase *cs = &node->switch_stmt.cases[i];
+            if (i)
+                fputc(',', out);
+            fprintf(out, "{\"is_default\":%s,\"value\":", cs->is_default ? "true" : "false");
+            ast_json_write_node(out, cs->value, depth + 1);
+            fputs(",\"body\":", out);
+            ast_json_write_node(out, cs->body, depth + 1);
+            fputc('}', out);
+        }
+        fputs("]}", out);
+    }
+    if (node->kind == ND_MATCH)
+    {
+        fputs(",\"match\":{\"expr\":", out);
+        ast_json_write_node(out, node->match_stmt.expr, depth + 1);
+        fputs(",\"arms\":[", out);
+        for (int i = 0; i < node->match_stmt.arm_count; ++i)
+        {
+            MatchArm *arm = &node->match_stmt.arms[i];
+            if (i)
+                fputc(',', out);
+            fputs("{\"pattern\":", out);
+            ast_json_write_node(out, arm->pattern, depth + 1);
+            fputs(",\"guard\":", out);
+            ast_json_write_node(out, arm->guard, depth + 1);
+            fputs(",\"body\":", out);
+            ast_json_write_node(out, arm->body, depth + 1);
+            fputs(",\"binding\":", out);
+            ast_json_write_string(out, arm->binding_name ? arm->binding_name : "");
+            fputc('}', out);
+        }
+        fputs("]}", out);
+    }
+    if (node->kind == ND_INIT_LIST)
+    {
+        fputs(",\"init\":{\"count\":", out);
+        fprintf(out, "%d", node->init.count);
+        fprintf(out, ",\"is_zero\":%s,\"is_array\":%s,\"elems\":", node->init.is_zero ? "true" : "false", node->init.is_array_literal ? "true" : "false");
+        ast_json_write_node_array(out, node->init.elems, node->init.count, depth + 1);
+        fputs("}", out);
+    }
+    if (node->kind == ND_UNIT)
+    {
+        fputs(",\"module\":", out);
+        ast_json_write_module_path(out, &node->module_path);
+        fputs(",\"imports\":[", out);
+        for (int i = 0; i < node->import_count; ++i)
+        {
+            if (i)
+                fputc(',', out);
+            ast_json_write_module_path(out, &node->imports[i]);
+        }
+        fputc(']', out);
+    }
+    fputc('}', out);
+}
+
+void ast_emit_json(FILE *out, const Node *unit, const char *input_path)
+{
+    if (!out)
+        return;
+    fputs("{\"file\":", out);
+    ast_json_write_string(out, input_path ? input_path : "");
+    fputs(",\"unit\":", out);
+    ast_json_write_node(out, unit, 0);
+    fputc('}', out);
+}
+
 // ---------------- Diagnostics -----------------
 static int g_errs = 0;
 static int g_warns = 0;
 
 static void vdiag_at(const SourceBuffer *src, int line, int col, const char *sev, const char *fmt, va_list ap)
 {
+    if (diag_data_log)
+    {
+        char *message = diag_format_message(fmt, ap);
+        diag_emit_data_log(sev, src, line, col, message);
+        free(message);
+        return;
+    }
     const char *file = src && src->filename ? src->filename : "<input>";
     if (diag_use_ansi)
     {
@@ -502,6 +1063,13 @@ static void vdiag_at(const SourceBuffer *src, int line, int col, const char *sev
 
 static void vdiag(const char *sev, const char *fmt, va_list ap)
 {
+    if (diag_data_log)
+    {
+        char *message = diag_format_message(fmt, ap);
+        diag_emit_data_log(sev, NULL, 0, 0, message);
+        free(message);
+        return;
+    }
     if (diag_use_ansi)
     {
         const char *color = diag_color_for(sev);

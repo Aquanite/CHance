@@ -2108,6 +2108,7 @@ static void populate_symbol_from_function(Symbol *s, Node *fn)
     s->is_extern = 0;
     s->abi = "C";
     s->sig.is_varargs = fn->is_varargs ? 1 : 0;
+    s->sig.param_const_flags = NULL;
     s->ast_node = fn;
 
     Type *decl_ret = fn->ret_type ? fn->ret_type : &ty_i32;
@@ -2177,6 +2178,22 @@ static void populate_symbol_from_function(Symbol *s, Node *fn)
     {
         s->sig.param_count = fn->param_count;
         s->sig.params = fn->param_types;
+    }
+
+    if (s->sig.param_count > 0 && fn->param_const_flags)
+    {
+        if (fn->param_count == s->sig.param_count)
+        {
+            s->sig.param_const_flags = fn->param_const_flags;
+        }
+        else
+        {
+            int copy = fn->param_count < s->sig.param_count ? fn->param_count : s->sig.param_count;
+            unsigned char *flags = (unsigned char *)xcalloc((size_t)s->sig.param_count, sizeof(unsigned char));
+            if (copy > 0)
+                memcpy(flags, fn->param_const_flags, (size_t)copy);
+            s->sig.param_const_flags = flags;
+        }
     }
 }
 
@@ -4718,10 +4735,13 @@ static void check_expr(SemaContext *sc, Node *e)
         {
             if (!can_assign(lhs_type, e->rhs))
             {
+                char want[64];
+                char got[64];
+                describe_type(lhs_type, want, sizeof(want));
+                describe_type(e->rhs->type, got, sizeof(got));
                 diag_error_at(e->src, e->line, e->col,
-                              "cannot assign '%d' to '%d' without cast",
-                              e->rhs->type ? e->rhs->type->kind : -1,
-                              lhs_type ? lhs_type->kind : -1);
+                              "cannot assign '%s' to '%s' without cast",
+                              got, want);
                 exit(1);
             }
             e->rhs->type = lhs_type;
@@ -4740,10 +4760,13 @@ static void check_expr(SemaContext *sc, Node *e)
         {
             if (!can_assign(lhs_type, e->rhs))
             {
+                char want[64];
+                char got[64];
+                describe_type(lhs_type, want, sizeof(want));
+                describe_type(e->rhs->type, got, sizeof(got));
                 diag_error_at(e->src, e->line, e->col,
-                              "cannot assign '%d' to '%d' without cast",
-                              e->rhs->type ? e->rhs->type->kind : -1,
-                              lhs_type ? lhs_type->kind : -1);
+                              "cannot assign '%s' to '%s' without cast",
+                              got, want);
                 exit(1);
             }
             e->rhs->type = lhs_type;
@@ -5070,7 +5093,18 @@ static void check_expr(SemaContext *sc, Node *e)
 
             int param_is_const = 0;
             if (e->call_target && e->call_target->param_const_flags && i < e->call_target->param_count)
+            {
                 param_is_const = e->call_target->param_const_flags[i];
+            }
+            else if (direct_sym && direct_sym->ast_node && direct_sym->ast_node->kind == ND_FUNC &&
+                     direct_sym->ast_node->param_const_flags && i < direct_sym->ast_node->param_count)
+            {
+                param_is_const = direct_sym->ast_node->param_const_flags[i];
+            }
+            else if (direct_sym && direct_sym->sig.param_const_flags && i < direct_sym->sig.param_count)
+            {
+                param_is_const = direct_sym->sig.param_const_flags[i];
+            }
             Type *canon_expected = canonicalize_type_deep(expected_ty);
             if (param_is_const)
                 continue;

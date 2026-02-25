@@ -4736,6 +4736,7 @@ static int parse_extend_decl(Parser *ps, int leading_noreturn)
         Token name = expect(ps, TK_IDENT, "identifier");
         expect(ps, TK_LPAREN, "(");
         Type **param_types = NULL;
+        unsigned char *param_const_flags = NULL;
         int param_count = 0;
         int param_cap = 0;
         int is_varargs = 0;
@@ -4760,10 +4761,12 @@ static int parse_extend_decl(Parser *ps, int leading_noreturn)
                     break;
                 }
 
+                int param_is_const = 0;
                 Token maybe_const = lexer_peek(ps->lx);
                 if (maybe_const.kind == TK_KW_CONSTANT)
                 {
                     lexer_next(ps->lx);
+                    param_is_const = 1;
                 }
 
                 Type *pty = parse_type_spec(ps);
@@ -4772,8 +4775,11 @@ static int parse_extend_decl(Parser *ps, int leading_noreturn)
                     param_cap = param_cap ? param_cap * 2 : 4;
                     param_types =
                         (Type **)realloc(param_types, sizeof(Type *) * param_cap);
+                    param_const_flags = (unsigned char *)realloc(param_const_flags, sizeof(unsigned char) * param_cap);
                 }
                 param_types[param_count] = pty;
+                if (param_const_flags)
+                    param_const_flags[param_count] = (unsigned char)param_is_const;
                 parse_trailing_funptr_signature(ps, pty);
                 param_count++;
                 Token maybe_name = lexer_peek(ps->lx);
@@ -4829,6 +4835,7 @@ static int parse_extend_decl(Parser *ps, int leading_noreturn)
         s.sig.ret = ret_ty ? ret_ty : &ti32_ext;
         s.sig.params = param_types;
         s.sig.param_count = param_count;
+        s.sig.param_const_flags = param_const_flags;
         s.sig.is_varargs = is_varargs;
         s.is_noreturn = is_noreturn;
         if (ps->ext_count == ps->ext_cap)
@@ -4855,6 +4862,7 @@ static int parse_extend_decl(Parser *ps, int leading_noreturn)
     expect(ps, TK_LPAREN, "(");
     int is_varargs = 0;
     Type **param_types = NULL;
+    unsigned char *param_const_flags = NULL;
     int param_count = 0;
     int param_cap = 0;
     Token pstart = lexer_peek(ps->lx);
@@ -4878,10 +4886,12 @@ static int parse_extend_decl(Parser *ps, int leading_noreturn)
                 break;
             }
 
+            int param_is_const = 0;
             Token maybe_const = lexer_peek(ps->lx);
             if (maybe_const.kind == TK_KW_CONSTANT)
             {
                 lexer_next(ps->lx);
+                param_is_const = 1;
             }
 
             Type *pty = parse_type_spec(ps);
@@ -4890,8 +4900,11 @@ static int parse_extend_decl(Parser *ps, int leading_noreturn)
                 param_cap = param_cap ? param_cap * 2 : 4;
                 param_types =
                     (Type **)realloc(param_types, sizeof(Type *) * param_cap);
+                param_const_flags = (unsigned char *)realloc(param_const_flags, sizeof(unsigned char) * param_cap);
             }
             param_types[param_count] = pty;
+            if (param_const_flags)
+                param_const_flags[param_count] = (unsigned char)param_is_const;
             parse_trailing_funptr_signature(ps, pty);
             param_count++;
             Token maybe_name = lexer_peek(ps->lx);
@@ -4969,6 +4982,7 @@ static int parse_extend_decl(Parser *ps, int leading_noreturn)
         s.sig.ret = &ti32;
     s.sig.params = param_types;
     s.sig.param_count = param_count;
+    s.sig.param_const_flags = param_const_flags;
     s.sig.is_varargs = is_varargs;
     s.is_noreturn = is_noreturn;
     if (ps->ext_count == ps->ext_cap)

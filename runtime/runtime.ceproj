@@ -1,4 +1,4 @@
 type=Library
 output=runtime.cclib
-ce=new.ce,panic.ce
+ce=memory.ce,panic.ce
 args=-O3 --freestanding

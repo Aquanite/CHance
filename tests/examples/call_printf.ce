@@ -6,6 +6,7 @@ bring LibTest.Another;
 bring Std;
 bring Std.File as File;
 
+
 #define WARN_MSG "diag warning triggered"
 #define NOTE_MSG "diag note triggered"
 #define ASSERT_OK 1
@@ -310,8 +311,7 @@ expose fun main() -> i32
     TC.SmallTest* addptr = Std.Memory.alloc(sizeof(TC.SmallTest) * 2) as TC.SmallTest*;
     
     addptr[0] = construct_thing();
-    addptr[1] = another;
-
+    addptr[1] = another; // hello world 
     
 
     assert(addptr[0].smallValue == 5, "addptr[0].smallValue == 5");
@@ -446,13 +446,13 @@ expose fun main() -> i32
     assert(CONDITIONAL_VALUE == 99, "#if/#else branch selection works");
     assert(FEATURE_SENTINEL == 30, "#elif branch selection works");
     assert(UNDEF_CHECK_VALUE == 456, "#undef clears definitions for guards");
-
+    
     assert(__CHANCE__ == 1, "__CHANCE__ builtin defined");
     assert(__CHANCE_VERSION_MAJOR__ == 0, "major version under 1");
     assert(__CHANCE_VERSION_MINOR__ >= 6, "minor version reflects progress");
     assert(__CHANCE_VERSION_PATCH__ >= 1, "patch version set");
     assert(__CHANCE_VERSION__ == (__CHANCE_VERSION_MAJOR__ * 10000 + __CHANCE_VERSION_MINOR__ * 100 + __CHANCE_VERSION_PATCH__), "aggregate version matches components");
-    assert(strcmp(__CHANCE_VERSION_STR__, "0.6.1") == 0, "string version matches 0.6.1");
+    assert(strcmp(__CHANCE_VERSION_STR__, "1.1.0") == 0, "string version matches 1.1.0");
     assert(__POINTER_WIDTH__ == (sizeof(void*) * 8), "__POINTER_WIDTH__ matches sizeof(void*)");
     if (sizeof(void*) == 8)
     {
@@ -523,6 +523,10 @@ expose fun main() -> i32
         .smallValue = 9,
         .testVar = 81
     };
+
+    string testthing = "test";
+
+
 
     i32 passbystruct_result = passbystruct(st);
     assert(passbystruct_result == 81, "passbystruct result is 81");
@@ -1094,7 +1098,7 @@ hide fun strcmp(string a, string b) -> i32
         i++;
     }
     ret (a[i] - b[i]) as i32;
-}
+} 
 
 hide fun abort() -> void
 {

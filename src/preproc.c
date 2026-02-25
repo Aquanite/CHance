@@ -1721,9 +1721,9 @@ char *chance_preprocess_source(const char *path, const char *src, int len,
 	st.date_literal[sizeof(st.date_literal) - 1] = '\0';
 	st.time_literal[sizeof(st.time_literal) - 1] = '\0';
 	define_builtin_macro(&st, "__CHANCE__", "1");
-	const int version_major = 0;
-	const int version_minor = 6;
-	const int version_patch = 1;
+	const int version_major = 1;
+	const int version_minor = 1;
+	const int version_patch = 0;
 	char version_compact[16];
 	snprintf(version_compact, sizeof(version_compact), "%d", version_major * 10000 + version_minor * 100 + version_patch);
 	define_builtin_macro(&st, "__CHANCE_VERSION__", version_compact);
