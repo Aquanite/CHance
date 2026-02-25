@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef enum
 {
@@ -293,7 +294,10 @@ typedef enum
     ND_LAMBDA_CALL,
 } NodeKind;
 
+typedef struct Node Node;
+
 const char *node_kind_name(NodeKind kind);
+void ast_emit_json(FILE *out, const Node *unit, const char *input_path);
 
 typedef struct
 {
@@ -302,7 +306,18 @@ typedef struct
     const char *filename;
 } SourceBuffer;
 
-typedef struct Node Node;
+// Diagnostics
+void diag_set_use_ansi(int enable);
+void diag_set_data_log(int enable);
+void diag_error_at(const SourceBuffer *src, int line, int col, const char *fmt, ...);
+void diag_warning_at(const SourceBuffer *src, int line, int col, const char *fmt, ...);
+void diag_note_at(const SourceBuffer *src, int line, int col, const char *fmt, ...);
+void diag_error(const char *fmt, ...);
+void diag_warning(const char *fmt, ...);
+void diag_note(const char *fmt, ...);
+int diag_error_count(void);
+int diag_warning_count(void);
+void diag_reset(void);
 
 typedef struct
 {
@@ -578,6 +593,7 @@ typedef struct FuncSig
     Type *ret;
     Type **params;
     int param_count;
+    unsigned char *param_const_flags;
     int is_varargs;
 } FuncSig;
 typedef struct Symbol

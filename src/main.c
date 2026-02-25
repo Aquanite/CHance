@@ -280,6 +280,12 @@ typedef struct
   Node *unit;
 } SymbolRefUnit;
 
+typedef struct
+{
+  char *original;
+  char *replacement;
+} OverrideFile;
+
 // sema
 int sema_eval_const_i32(Node *expr);
 SemaContext *sema_create(void);
@@ -339,6 +345,14 @@ static void usage(const char *prog)
           "  -vd             Verbose + optimizer deep-dive visuals\n");
   fprintf(stderr,
           "  --no-ansi        Disable colored diagnostics (verbose too)\n");
+    fprintf(stderr,
+      "  --data-log      Emit machine-readable diagnostics (JSON lines)\n");
+      fprintf(stderr,
+        "  --request-ast   Emit AST JSON to stdout and exit\n");
+        fprintf(stderr,
+          "  --diagnostics-only Run parser/sema checks and emit diagnostics only\n");
+        fprintf(stderr,
+          "  --override-file <orig>=<path> Use override source for a specific input\n");
     fprintf(stderr,
       "  --implicit-voidp Allow implicit pointer to void* conversions\n");
       fprintf(stderr,
@@ -887,6 +901,120 @@ static void resolve_project_relative_path(char *dst, size_t dstsz,
     snprintf(dst, dstsz, "%s%s", base_dir, rel);
 }
 
+static void normalize_path_simple(char *dst, size_t dstsz, const char *src)
+{
+  if (!dst || dstsz == 0)
+    return;
+  dst[0] = '\0';
+  if (!src || !*src)
+    return;
+#ifdef _WIN32
+  if (_fullpath(dst, src, dstsz))
+    return;
+#else
+  if (realpath(src, dst))
+    return;
+#endif
+  snprintf(dst, dstsz, "%s", src);
+}
+
+static const char *get_cwd_path(char *buf, size_t bufsz)
+{
+  if (!buf || bufsz == 0)
+    return NULL;
+#ifdef _WIN32
+  if (_getcwd(buf, (int)bufsz))
+    return buf;
+#else
+  if (getcwd(buf, bufsz))
+    return buf;
+#endif
+  buf[0] = '\0';
+  return NULL;
+}
+
+static int parse_override_spec(const char *spec, const char *base_dir,
+                               char *orig, size_t origsz,
+                               char *repl, size_t replsz)
+{
+  if (!spec || !orig || !repl)
+    return -1;
+  const char *eq = strchr(spec, '=');
+  if (!eq || eq == spec || !eq[1])
+    return -1;
+  char left[1024];
+  char right[1024];
+  size_t left_len = (size_t)(eq - spec);
+  if (left_len >= sizeof(left))
+    left_len = sizeof(left) - 1;
+  memcpy(left, spec, left_len);
+  left[left_len] = '\0';
+  snprintf(right, sizeof(right), "%s", eq + 1);
+  char resolved_left[1024];
+  char resolved_right[1024];
+  resolve_project_relative_path(resolved_left, sizeof(resolved_left), base_dir,
+                                left);
+  resolve_project_relative_path(resolved_right, sizeof(resolved_right), base_dir,
+                                right);
+  normalize_path_simple(orig, origsz, resolved_left);
+  normalize_path_simple(repl, replsz, resolved_right);
+  if (!orig[0] || !repl[0])
+    return -1;
+  return 0;
+}
+
+static int add_override_file(const char *spec, const char *base_dir,
+                             OverrideFile **list, int *count, int *cap)
+{
+  if (!spec || !list || !count || !cap)
+    return -1;
+  char orig[1024];
+  char repl[1024];
+  if (parse_override_spec(spec, base_dir, orig, sizeof(orig), repl, sizeof(repl)) != 0)
+    return -1;
+  if (*count == *cap)
+  {
+    int new_cap = *cap ? (*cap * 2) : 4;
+    OverrideFile *grown = (OverrideFile *)realloc(
+        *list, sizeof(OverrideFile) * (size_t)new_cap);
+    if (!grown)
+      return -1;
+    for (int i = *cap; i < new_cap; ++i)
+    {
+      grown[i].original = NULL;
+      grown[i].replacement = NULL;
+    }
+    *list = grown;
+    *cap = new_cap;
+  }
+  OverrideFile *slot = &(*list)[*count];
+  slot->original = xstrdup(orig);
+  slot->replacement = xstrdup(repl);
+  if (!slot->original || !slot->replacement)
+    return -1;
+  (*count)++;
+  return 0;
+}
+
+static const char *find_override_path(const char *input,
+                                      const OverrideFile *list, int count)
+{
+  if (!input || !list || count <= 0)
+    return NULL;
+  char normalized[1024];
+  normalize_path_simple(normalized, sizeof(normalized), input);
+  for (int i = 0; i < count; ++i)
+  {
+    const OverrideFile *entry = &list[i];
+    if (!entry->original || !entry->replacement)
+      continue;
+    if ((normalized[0] && strcmp(normalized, entry->original) == 0) ||
+        strcmp(input, entry->original) == 0)
+      return entry->replacement;
+  }
+  return NULL;
+}
+
 typedef struct
 {
   const char ***items;
@@ -1239,6 +1367,11 @@ typedef struct
   const char **obj_override;
   int *implicit_voidp;
   int *implicit_sizeof;
+  int *request_ast;
+  int *diagnostics_only;
+  OverrideFile **override_files;
+  int *override_file_count;
+  int *override_file_cap;
   ProjectInputList symbol_ref_ce_list;
   ProjectInputList symbol_ref_cclib_list;
 } ProjectArgState;
@@ -1636,6 +1769,67 @@ static int project_args_apply(const char *proj_path, int lineno,
       compiler_verbose_set_use_ansi(0);
       continue;
     }
+    if (strcmp(arg, "--data-log") == 0)
+    {
+      diag_set_data_log(1);
+      diag_set_use_ansi(0);
+      verbose_use_ansi = 0;
+      compiler_verbose_set_use_ansi(0);
+      continue;
+    }
+    if (strcmp(arg, "--request-ast") == 0)
+    {
+      if (state->request_ast)
+        *state->request_ast = 1;
+      continue;
+    }
+    if (strcmp(arg, "--diagnostics-only") == 0 || strcmp(arg, "--diag-only") == 0)
+    {
+      if (state->diagnostics_only)
+        *state->diagnostics_only = 1;
+      continue;
+    }
+    if (strcmp(arg, "--override-file") == 0)
+    {
+      if (i + 1 >= count)
+      {
+        fprintf(stderr,
+                "error: --override-file expects <original>=<override> in '%s' (line %d)\n",
+                proj_path, lineno);
+        return -1;
+      }
+      const char *spec = args[++i];
+      if (state->override_files && state->override_file_count && state->override_file_cap)
+      {
+        if (add_override_file(spec, project_dir,
+                              state->override_files, state->override_file_count,
+                              state->override_file_cap) != 0)
+        {
+          fprintf(stderr,
+                  "error: invalid --override-file '%s' in '%s' (line %d)\n",
+                  spec, proj_path, lineno);
+          return -1;
+        }
+      }
+      continue;
+    }
+    if (strncmp(arg, "--override-file=", 16) == 0)
+    {
+      const char *spec = arg + 16;
+      if (state->override_files && state->override_file_count && state->override_file_cap)
+      {
+        if (add_override_file(spec, project_dir,
+                              state->override_files, state->override_file_count,
+                              state->override_file_cap) != 0)
+        {
+          fprintf(stderr,
+                  "error: invalid --override-file '%s' in '%s' (line %d)\n",
+                  spec, proj_path, lineno);
+          return -1;
+        }
+      }
+      continue;
+    }
     if (strncmp(arg, "-sr:", 4) == 0)
     {
       const char *sr_path = arg + 4;
@@ -1726,7 +1920,9 @@ static int parse_ceproj_file(
   int *strip_metadata, int *strip_hard, int *obfuscate,
   AsmSyntax *asm_syntax, const char **chancecodec_cmd_override,
   const char **host_cc_cmd_override, const char **obj_override,
-  int *implicit_voidp, int *implicit_sizeof,
+  int *implicit_voidp, int *implicit_sizeof, int *request_ast,
+  int *diagnostics_only,
+  OverrideFile **override_files, int *override_file_count, int *override_file_cap,
   ProjectInputList symbol_ref_ce_list,
   ProjectInputList symbol_ref_cclib_list, char **after_cmd)
 {
@@ -1960,6 +2156,11 @@ static int parse_ceproj_file(
           .obj_override = obj_override,
           .implicit_voidp = implicit_voidp,
           .implicit_sizeof = implicit_sizeof,
+          .request_ast = request_ast,
+          .diagnostics_only = diagnostics_only,
+          .override_files = override_files,
+          .override_file_count = override_file_count,
+          .override_file_cap = override_file_cap,
           .symbol_ref_ce_list = symbol_ref_ce_list,
           .symbol_ref_cclib_list = symbol_ref_cclib_list};
 
@@ -3420,8 +3621,11 @@ static int collect_functions_from_unit(const Node *unit,
       continue;
     LibraryFunction out = {0};
     out.name = xstrdup(fn->name);
-    const char *backend =
-        fn->metadata.backend_name ? fn->metadata.backend_name : fn->name;
+    const char *backend = NULL;
+    if (fn->export_name)
+      backend = fn->name;
+    else
+      backend = fn->metadata.backend_name ? fn->metadata.backend_name : fn->name;
     out.backend_name = backend ? xstrdup(backend) : NULL;
     Type *ret_ty = fn->ret_type ? fn->ret_type : type_i32();
     out.return_spec = type_to_spec(ret_ty);
@@ -4208,6 +4412,54 @@ static int merge_stdlib_externs_into_imported(
   return 0;
 }
 
+static int merge_cert_externs_into_imported(
+    Symbol **imported_syms, int *imported_count, int *imported_cap,
+    const LoadedLibraryFunction *funcs, int func_count)
+{
+  if (!imported_syms || !imported_count || !imported_cap || !funcs ||
+      func_count <= 0)
+    return 0;
+
+  for (int i = 0; i < func_count; ++i)
+  {
+    const LoadedLibraryFunction *lf = &funcs[i];
+    if (!lf->qualified_name)
+      continue;
+    if (!lf->is_exposed)
+      continue;
+
+    const char *backend = lf->backend_name ? lf->backend_name : lf->qualified_name;
+    const char *logical = lf->name ? lf->name : lf->qualified_name;
+    const char *name = backend && *backend ? backend : logical;
+    if (!name || strncmp(name, "__cert__", 8) != 0)
+      continue;
+
+    Symbol sym = {0};
+    sym.kind = SYM_FUNC;
+    sym.name = lf->qualified_name;
+    sym.backend_name = lf->backend_name ? lf->backend_name : lf->qualified_name;
+    sym.is_extern = 1;
+    sym.abi = "C";
+    sym.sig.ret = lf->return_type ? lf->return_type : type_i32();
+    sym.sig.params = lf->param_types;
+    sym.sig.param_count = lf->param_count;
+    sym.sig.is_varargs = lf->is_varargs;
+    sym.is_noreturn = lf->is_noreturn;
+
+    const char *effective = (sym.backend_name && *sym.backend_name)
+                                ? sym.backend_name
+                                : sym.name;
+    if (effective && imported_symbol_has_name(*imported_syms, *imported_count,
+                                              effective))
+      continue;
+    if (append_imported_symbol(imported_syms, imported_count, imported_cap,
+                               &sym) != 0)
+      return 1;
+  }
+
+  return 0;
+}
+
 static int load_cclib_library(const char *path, LoadedLibrary **libs,
                               int *lib_count, int *lib_cap,
                               LoadedLibraryFunction **funcs, int *func_count,
@@ -4640,6 +4892,11 @@ int main(int argc, char **argv)
   int obfuscate = 0;
   int implicit_voidp = 0;
   int implicit_sizeof = 0;
+  int request_ast = 0;
+  int diagnostics_only = 0;
+  OverrideFile *override_files = NULL;
+  int override_file_count = 0;
+  int override_file_cap = 0;
   char strip_map_path[STRIP_MAP_PATH_MAX] = {0};
   int strip_map_ready = 0;
   int pending_ce_output_index = -1;
@@ -4684,6 +4941,8 @@ int main(int argc, char **argv)
   char exe_dir[1024] = {0};
   get_executable_dir(exe_dir, sizeof(exe_dir), argv[0]);
   chance_add_default_include_dirs(&include_dirs, &include_dir_count);
+  char cwd_buf[1024] = {0};
+  const char *cwd = get_cwd_path(cwd_buf, sizeof(cwd_buf));
 
   LibraryModuleData *library_modules = NULL;
   int library_module_count = 0;
@@ -4710,7 +4969,7 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[i], "--version") == 0)
     {
-      printf("chancec: CHance Compiler version 1.0.0\n");
+      printf("chancec: CHance Compiler version 1.1.0\n");
       printf("chancec: CE language standard: H26\n");
       printf("chancec: License: OpenAzure License\n");
       printf("chancec: Compiled on %s %s\n", __DATE__, __TIME__);
@@ -4956,6 +5215,51 @@ int main(int argc, char **argv)
       compiler_verbose_set_use_ansi(0);
       continue;
     }
+    if (strcmp(argv[i], "--data-log") == 0)
+    {
+      diag_set_data_log(1);
+      diag_set_use_ansi(0);
+      verbose_use_ansi = 0;
+      compiler_verbose_set_use_ansi(0);
+      continue;
+    }
+    if (strcmp(argv[i], "--request-ast") == 0)
+    {
+      request_ast = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--diagnostics-only") == 0 || strcmp(argv[i], "--diag-only") == 0)
+    {
+      diagnostics_only = 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--override-file") == 0)
+    {
+      if (i + 1 >= argc)
+      {
+        fprintf(stderr, "error: --override-file expects <original>=<override>\n");
+        return 2;
+      }
+      const char *spec = argv[++i];
+      if (add_override_file(spec, cwd, &override_files, &override_file_count,
+                            &override_file_cap) != 0)
+      {
+        fprintf(stderr, "error: invalid --override-file '%s'\n", spec);
+        return 2;
+      }
+      continue;
+    }
+    if (strncmp(argv[i], "--override-file=", 16) == 0)
+    {
+      const char *spec = argv[i] + 16;
+      if (add_override_file(spec, cwd, &override_files, &override_file_count,
+                            &override_file_cap) != 0)
+      {
+        fprintf(stderr, "error: invalid --override-file '%s'\n", spec);
+        return 2;
+      }
+      continue;
+    }
     if (strcmp(argv[i], "--implicit-voidp") == 0)
     {
       implicit_voidp = 1;
@@ -5040,7 +5344,9 @@ int main(int argc, char **argv)
           &freestanding_requested, &m32, &opt_level, &debug_symbols,
           &strip_metadata, &strip_hard, &obfuscate, &asm_syntax,
           &chancecodec_cmd_override, &host_cc_cmd_override, &obj_override,
-          &implicit_voidp, &implicit_sizeof,
+          &implicit_voidp, &implicit_sizeof, &request_ast,
+          &diagnostics_only,
+          &override_files, &override_file_count, &override_file_cap,
           (ProjectInputList){&symbol_ref_ce_inputs, &symbol_ref_ce_count,
                    &symbol_ref_ce_cap, &owned_ce_inputs,
                    &owned_ce_count, &owned_ce_cap, NULL},
@@ -5113,12 +5419,12 @@ int main(int argc, char **argv)
     fprintf(stderr, "error: -S and -Sccb cannot be used together\n");
     return 2;
   }
-  if (stop_after_asm && target_arch == ARCH_NONE)
+  if (stop_after_asm && target_arch == ARCH_NONE && !request_ast && !diagnostics_only)
   {
     fprintf(stderr, "error: -S requires a backend selection (e.g., -x86 or -arm64)\n");
     return 2;
   }
-  if (!emit_library && target_arch == ARCH_NONE)
+  if (!emit_library && target_arch == ARCH_NONE && !request_ast && !diagnostics_only)
   {
     if (!stop_after_ccb)
     {
@@ -5526,10 +5832,13 @@ int main(int argc, char **argv)
     for (int si = 0; si < symbol_ref_ce_count; ++si)
     {
       const char *input = symbol_ref_ce_inputs[si];
+      const char *override_path =
+          find_override_path(input, override_files, override_file_count);
+      const char *read_path = override_path ? override_path : input;
       if (compiler_verbose_enabled())
         verbose_progress("sr-ce-load", si + 1, symbol_ref_ce_count);
       int len = 0;
-      char *src = read_all(input, &len);
+      char *src = read_all(read_path, &len);
       if (!src)
       {
         rc = 1;
@@ -5566,10 +5875,13 @@ int main(int argc, char **argv)
   for (int fi = 0; fi < ce_count; ++fi)
   {
     const char *input = ce_inputs[fi];
+    const char *override_path =
+        find_override_path(input, override_files, override_file_count);
+    const char *read_path = override_path ? override_path : input;
     if (compiler_verbose_enabled())
       verbose_progress("ce-load", fi + 1, ce_count);
     int len = 0;
-    char *src = read_all(input, &len);
+    char *src = read_all(read_path, &len);
     if (!src)
     {
       rc = 1;
@@ -5598,6 +5910,41 @@ int main(int argc, char **argv)
   }
   if (rc)
     goto cleanup;
+
+  if (request_ast)
+  {
+    FILE *ast_out = stdout;
+    fputc('[', ast_out);
+    int emitted = 0;
+    for (int fi = 0; fi < ce_count; ++fi)
+    {
+      if (!units || !units[fi].unit)
+        continue;
+      if (emitted)
+        fputc(',', ast_out);
+      ast_emit_json(ast_out, units[fi].unit, units[fi].input_path);
+      emitted = 1;
+    }
+    fputs("]\n", ast_out);
+    fflush(ast_out);
+    rc = 0;
+    goto cleanup;
+  }
+
+  if (diagnostics_only)
+  {
+    if (compiler_verbose_enabled() && ce_count > 0)
+      verbose_section("Diagnostics-only checks");
+    for (int fi = 0; fi < ce_count; ++fi)
+    {
+      if (compiler_verbose_enabled())
+        verbose_progress("ce-sema", fi + 1, ce_count);
+      UnitCompile *uc = &units[fi];
+      if (sema_check_unit(uc->sc, uc->unit) != 0)
+        rc = 1;
+    }
+    goto cleanup;
+  }
 
   if (compiler_verbose_enabled() && ce_count > 0)
     verbose_section("Registering CE externs");
@@ -5758,6 +6105,14 @@ int main(int argc, char **argv)
       Symbol *imported_syms = sema_copy_imported_function_symbols(sc, &imported_count);
       int imported_cap = imported_count;
       if (merge_stdlib_externs_into_imported(
+              &imported_syms, &imported_count, &imported_cap,
+              loaded_library_functions, loaded_library_function_count) != 0)
+      {
+        rc = 1;
+        free(imported_syms);
+        break;
+      }
+      if (merge_cert_externs_into_imported(
               &imported_syms, &imported_count, &imported_cap,
               loaded_library_functions, loaded_library_function_count) != 0)
       {
@@ -6917,6 +7272,15 @@ cleanup:
     free(project_output_alloc);
   if (project_after_cmd)
     free(project_after_cmd);
+  if (override_files)
+  {
+    for (int i = 0; i < override_file_count; ++i)
+    {
+      free(override_files[i].original);
+      free(override_files[i].replacement);
+    }
+    free(override_files);
+  }
   free((void *)ce_inputs);
   free((void *)ccb_inputs);
   free((void *)cclib_inputs);

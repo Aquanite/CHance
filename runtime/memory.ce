@@ -1,0 +1,39 @@
+extend from "C" void* malloc(u64 size);
+extend from "C" void free(void* ptr);
+extend from "C" void* memcpy(void* dest, constant void* src, u64 n);
+extend from "C" void* memset(void* s, i32 c, u64 n);
+extend from "C" u64 strlen(constant char* s);
+extend from "C" u64 strlen(constant char* s);
+
+extend fun __cert__panic(char* message) -> void;
+
+[Export]
+expose fun __cert__malloc(u64 size) -> void* {
+    void* ptr = malloc(size);
+    if (ptr == null) {
+        __cert__panic("Out of memory");
+    }
+    ret ptr;
+}
+
+[Export]
+expose fun __cert__free(void* ptr) -> void {
+    if (ptr != null) {
+        free(ptr);
+    }
+}
+
+[Export]
+expose fun __cert__memcpy(void* dest, constant void* src, u64 n) -> void* {
+    ret memcpy(dest, src, n);
+}
+
+[Export]
+expose fun __cert__memset(void* s, i32 c, u64 n) -> void* {
+    ret memset(s, c, n);
+}
+
+[Export]
+expose fun __cert__strlen(constant char* s) -> u64 {
+    ret strlen(s);
+}
