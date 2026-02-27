@@ -74,7 +74,7 @@ struct SockAddrIn
 };
 
 #if defined(_WIN32) || defined(__WIN32__)
-global i32 wsa_ready = 0;
+i32 wsa_ready = 0;
 #endif
 
 hide fun net_errno() -> i32
