@@ -2774,6 +2774,30 @@ static int can_assign(Type *target, Node *rhs)
         rhs->type = canon_target;
         return 1;
     }
+    if (rhs->kind == ND_NEW)
+    {
+        Type *rhs_ty = canonicalize_type_deep(rhs->type);
+        if (rhs_ty && rhs_ty->kind == TY_PTR)
+        {
+            if (type_equal(canon_target, rhs_ty))
+            {
+                rhs->type = canon_target;
+                return 1;
+            }
+            if (canon_target->kind == TY_PTR && rhs_ty->pointee && canon_target->pointee && type_equal(canon_target->pointee, rhs_ty->pointee))
+            {
+                rhs->type = canon_target;
+                return 1;
+            }
+            // Fallback: accept assignment when both sides are pointers (practical/lenient)
+            if (canon_target->kind == TY_PTR && rhs_ty->kind == TY_PTR)
+            {
+                rhs->type = canon_target;
+                return 1;
+            }
+            return 0;
+        }
+    }
     if (sema_allow_implicit_voidp && canon_target->kind == TY_PTR && canon_target->pointee &&
         canon_target->pointee->kind == TY_VOID)
     {
@@ -4026,6 +4050,60 @@ static void check_expr(SemaContext *sc, Node *e)
         e->type = &char_ptr;
         return;
     }
+    if (e->kind == ND_NEW)
+    {
+        if (!e->type)
+        {
+            diag_error_at(e->src, e->line, e->col,
+                          "new expression missing target type");
+            exit(1);
+        }
+        Type *ptr_ty = canonicalize_type_deep(e->type);
+        if (!ptr_ty || ptr_ty->kind != TY_PTR || !ptr_ty->pointee)
+        {
+            diag_error_at(e->src, e->line, e->col,
+                          "'new' requires a pointer target type");
+            exit(1);
+        }
+        Type *elem = canonicalize_type_deep(ptr_ty->pointee);
+        if (!elem)
+        {
+            diag_error_at(e->src, e->line, e->col,
+                          "cannot allocate incomplete type");
+            exit(1);
+        }
+        if (elem->kind == TY_VOID)
+        {
+            diag_error_at(e->src, e->line, e->col,
+                          "cannot allocate object of type 'void'");
+            exit(1);
+        }
+        int elem_size = sizeof_type_bytes(elem);
+        if (elem_size <= 0)
+        {
+            diag_error_at(e->src, e->line, e->col,
+                          "cannot allocate object of incomplete type");
+            exit(1);
+        }
+        if (e->lhs)
+        {
+            check_expr(sc, e->lhs);
+            if (!type_is_int(e->lhs->type))
+            {
+                diag_error_at(e->lhs->src, e->lhs->line, e->lhs->col,
+                              "array count in 'new' must be an integer");
+                exit(1);
+            }
+            if (e->lhs->kind == ND_INT && e->lhs->int_val < 0)
+            {
+                diag_error_at(e->lhs->src, e->lhs->line, e->lhs->col,
+                              "negative array size in 'new'");
+                exit(1);
+            }
+        }
+        e->type = ptr_ty;
+        return;
+    }
     if (e->kind == ND_MEMBER)
     {
         if (!e->lhs)
@@ -4747,6 +4825,33 @@ static void check_expr(SemaContext *sc, Node *e)
             e->rhs->type = lhs_type;
         }
         e->type = lhs_type ? lhs_type : (e->rhs->type ? e->rhs->type : &ty_i32);
+        return;
+    }
+
+    if (e->kind == ND_DELETE)
+    {
+        if (!e->lhs)
+        {
+            diag_error_at(e->src, e->line, e->col,
+                          "delete missing operand");
+            exit(1);
+        }
+        check_expr(sc, e->lhs);
+        Type *ptr_ty = canonicalize_type_deep(e->lhs->type);
+        if (!ptr_ty || ptr_ty->kind != TY_PTR || !ptr_ty->pointee)
+        {
+            diag_error_at(e->lhs->src, e->lhs->line, e->lhs->col,
+                          "delete requires a pointer operand");
+            exit(1);
+        }
+        Type *elem = canonicalize_type_deep(ptr_ty->pointee);
+        if (!elem || elem->kind == TY_VOID)
+        {
+            diag_error_at(e->lhs->src, e->lhs->line, e->lhs->col,
+                          "cannot delete pointer to incomplete or void type");
+            exit(1);
+        }
+        e->type = &ty_i32; /* deletion as statement expression yields int-ish, but treated as void by stmt checker */
         return;
     }
     if (e->kind == ND_ADD_ASSIGN || e->kind == ND_SUB_ASSIGN || e->kind == ND_MUL_ASSIGN ||
@@ -5605,6 +5710,31 @@ static int sema_check_statement(SemaContext *sc, Node *stmt, Node *fn, int *foun
         if (stmt->lhs)
             check_expr(sc, stmt->lhs);
         return 0;
+    case ND_DELETE:
+    {
+        if (!stmt->lhs)
+        {
+            diag_error_at(stmt->src, stmt->line, stmt->col,
+                          "delete missing operand");
+            return 1;
+        }
+        check_expr(sc, stmt->lhs);
+        Type *ptr_ty = canonicalize_type_deep(stmt->lhs->type);
+        if (!ptr_ty || ptr_ty->kind != TY_PTR || !ptr_ty->pointee)
+        {
+            diag_error_at(stmt->lhs->src, stmt->lhs->line, stmt->lhs->col,
+                          "delete requires a pointer operand");
+            return 1;
+        }
+        Type *elem = canonicalize_type_deep(ptr_ty->pointee);
+        if (!elem || elem->kind == TY_VOID)
+        {
+            diag_error_at(stmt->lhs->src, stmt->lhs->line, stmt->lhs->col,
+                          "cannot delete pointer to incomplete or void type");
+            return 1;
+        }
+        return 0;
+    }
     case ND_IF:
         if (stmt->lhs)
             check_expr(sc, stmt->lhs);

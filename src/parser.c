@@ -2940,6 +2940,7 @@ static Node *parse_primary(Parser *ps)
             n->src = lexer_source(ps->lx);
             return n;
         }
+
         if (t.length == 12 && strncmp(t.lexeme, "__FUNCTION__", 12) == 0)
         {
             if (!ps->current_function_name)
@@ -3485,6 +3486,43 @@ static Node *parse_unary(Parser *ps)
         Node *operand = parse_unary(ps);
         Node *n = new_node(ND_LNOT);
         n->lhs = operand;
+        n->line = p.line;
+        n->col = p.col;
+        n->src = lexer_source(ps->lx);
+        return n;
+    }
+    if (p.kind == TK_KW_NEW)
+    {
+        lexer_next(ps->lx);
+        Type *ty = parse_type_spec(ps);
+        Node *n = new_node(ND_NEW);
+        // If the parsed type was an array type (e.g., 'int[5]'),
+        // treat that array length as the count for the 'new' expression
+        // and set the node type to pointer-to-element.
+        if (ty && ty->kind == TY_ARRAY && ty->array.elem && !ty->array.is_unsized)
+        {
+            n->type = type_ptr(ty->array.elem);
+            Node *count = new_node(ND_INT);
+            count->int_val = ty->array.length;
+            count->int_uval = (uint64_t)ty->array.length;
+            count->int_width = 0;
+            count->type = type_i32(); // use default int type for integer literal
+            n->lhs = count;
+        }
+        else
+        {
+            // store the element type in node->type as pointer-to(elem)
+            n->type = type_ptr(ty);
+        }
+        // optional array form: new T[expr]
+        Token nxt = lexer_peek(ps->lx);
+        if (nxt.kind == TK_LBRACKET)
+        {
+            lexer_next(ps->lx); // consume '['
+            Node *count = parse_expr(ps);
+            expect(ps, TK_RBRACKET, "]");
+            n->lhs = count; // use lhs to hold the count expression
+        }
         n->line = p.line;
         n->col = p.col;
         n->src = lexer_source(ps->lx);
@@ -4066,6 +4104,18 @@ static Node *parse_stmt(Parser *ps)
         r->col = t.col;
         r->src = lexer_source(ps->lx);
         return r;
+    }
+    if (t.kind == TK_KW_DELETE)
+    {
+        lexer_next(ps->lx);
+        Node *expr = parse_expr(ps);
+        expect(ps, TK_SEMI, ";");
+        Node *n = new_node(ND_DELETE);
+        n->lhs = expr;
+        n->line = t.line;
+        n->col = t.col;
+        n->src = lexer_source(ps->lx);
+        return n;
     }
     if (t.kind == TK_KW_VAR)
     {

@@ -73,6 +73,8 @@ typedef enum
     TK_KW_BRING,
     TK_KW_HIDE,
     TK_KW_EXPOSE,
+    TK_KW_NEW,
+    TK_KW_DELETE,
     // punctuation
     TK_ARROW,      // ->
     TK_LPAREN,     // (
@@ -281,6 +283,8 @@ typedef enum
     ND_COND,      // ternary conditional expr: lhs ? rhs : body
     ND_MEMBER,    // struct/enum member access
     ND_INIT_LIST, // brace initializer
+    ND_NEW,
+    ND_DELETE,
     ND_SHL,       // <<
     ND_SHR,       // >>
     ND_BITAND,    // &

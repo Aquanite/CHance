@@ -1,4 +1,5 @@
 extend from "C" void* malloc(u64 size);
+extend from "C" void* realloc(void* ptr, u64 size);
 extend from "C" void free(void* ptr);
 extend from "C" void* memcpy(void* dest, constant void* src, u64 n);
 extend from "C" void* memset(void* s, i32 c, u64 n);
@@ -21,6 +22,15 @@ expose fun __cert__free(void* ptr) -> void {
     if (ptr != null) {
         free(ptr);
     }
+}
+
+[Export]
+expose fun __cert__realloc(void* ptr, u64 size) -> void* {
+    void* new_ptr = realloc(ptr, size);
+    if (new_ptr == null) {
+        __cert__panic("Out of memory");
+    }
+    ret new_ptr;
 }
 
 [Export]

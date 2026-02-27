@@ -5494,6 +5494,52 @@ static int ccb_emit_expr_basic_impl(CcbFunctionBuilder *fb, const Node *expr)
         }
         return ccb_emit_struct_literal_expr(fb, expr);
     }
+    case ND_NEW:
+    {
+        if (!expr->type || expr->type->kind != TY_PTR || !expr->type->pointee)
+        {
+            diag_error_at(expr->src, expr->line, expr->col,
+                          "new: target type must be a pointer to an element type");
+            return 1;
+        }
+        const Type *elem = expr->type->pointee;
+        size_t elem_size = ccb_type_size_bytes(elem);
+        if (elem_size == 0)
+        {
+            diag_error_at(expr->src, expr->line, expr->col,
+                          "new: cannot allocate incomplete or void type");
+            return 1;
+        }
+
+        // Compute allocation size (u64)
+        if (expr->lhs)
+        {
+            if (ccb_emit_expr_basic(fb, expr->lhs))
+                return 1;
+            if (ccb_emit_convert_between(fb, ccb_type_for_expr(expr->lhs), CC_TYPE_I64, expr->lhs))
+                return 1;
+            if (!ccb_emit_const(&fb->body, CC_TYPE_I64, (int64_t)elem_size))
+                return 1;
+            if (!string_list_appendf(&fb->body, "  binop mul %s", cc_type_name(CC_TYPE_I64)))
+                return 1;
+        }
+        else
+        {
+            if (!ccb_emit_const(&fb->body, CC_TYPE_I64, (int64_t)elem_size))
+                return 1;
+        }
+
+        // Ensure extern for malloc wrapper
+        if (!ccb_module_has_function(fb->module, "__cert__new") && !ccb_module_has_extern(fb->module, "__cert__new"))
+        {
+            if (!ccb_module_appendf(fb->module, ".extern __cert__new params=(u64) returns=ptr"))
+                return 1;
+        }
+
+        if (!string_list_appendf(&fb->body, "  call __cert__new ptr (u64)"))
+            return 1;
+        return 0;
+    }
     case ND_INT:
     {
         CCValueType ty = map_type_to_cc(expr->type);
@@ -7321,6 +7367,17 @@ static int ccb_emit_stmt_basic_impl(CcbFunctionBuilder *fb, const Node *stmt)
     case ND_RET:
         if (stmt->lhs)
         {
+            // if this is the entrypoint, call GC prep exit before returning
+            if (fb->fn && fb->fn->is_entrypoint)
+            {
+                if (!ccb_module_has_function(fb->module, "__cert__GC__prep_exit") && !ccb_module_has_extern(fb->module, "__cert__GC__prep_exit"))
+                {
+                    if (!ccb_module_appendf(fb->module, ".extern __cert__GC__prep_exit params=() returns=void"))
+                        return 1;
+                }
+                if (!string_list_appendf(&fb->body, "  call __cert__GC__prep_exit void ()"))
+                    return 1;
+            }
             if (ccb_emit_expr_basic(fb, stmt->lhs))
                 return 1;
             if (!string_list_append(&fb->body, "  ret"))
@@ -7328,6 +7385,17 @@ static int ccb_emit_stmt_basic_impl(CcbFunctionBuilder *fb, const Node *stmt)
         }
         else
         {
+            // if this is the entrypoint, call GC prep exit before returning
+            if (fb->fn && fb->fn->is_entrypoint)
+            {
+                if (!ccb_module_has_function(fb->module, "__cert__GC__prep_exit") && !ccb_module_has_extern(fb->module, "__cert__GC__prep_exit"))
+                {
+                    if (!ccb_module_appendf(fb->module, ".extern __cert__GC__prep_exit params=() returns=void"))
+                        return 1;
+                }
+                if (!string_list_appendf(&fb->body, "  call __cert__GC__prep_exit void ()"))
+                    return 1;
+            }
             if (!string_list_append(&fb->body, "  ret void"))
                 return 1;
         }
@@ -7344,6 +7412,108 @@ static int ccb_emit_stmt_basic_impl(CcbFunctionBuilder *fb, const Node *stmt)
                 return 1;
         }
         return 0;
+    case ND_DELETE:
+    {
+        if (!stmt->lhs)
+        {
+            diag_error_at(stmt->src, stmt->line, stmt->col,
+                          "delete missing operand");
+            return 1;
+        }
+
+        // Ensure extern for free wrapper
+        if (!ccb_module_has_function(fb->module, "__cert__delete") && !ccb_module_has_extern(fb->module, "__cert__delete"))
+        {
+            if (!ccb_module_appendf(fb->module, ".extern __cert__delete params=(ptr) returns=void"))
+                return 1;
+        }
+
+        // Handle different lvalue kinds so we can null the pointer after free.
+        const Node *target = stmt->lhs;
+        if (target->kind == ND_VAR && target->var_ref)
+        {
+            // Load variable value, call free, then store null into variable
+            CcbLocal *local = ccb_local_lookup(fb, target->var_ref);
+            if (local)
+            {
+                if (!ccb_emit_load_local(fb, local))
+                    return 1;
+                if (!string_list_appendf(&fb->body, "  call __cert__delete void (ptr)"))
+                    return 1;
+                if (!ccb_emit_const_zero(&fb->body, CC_TYPE_PTR))
+                    return 1;
+                if (!ccb_emit_store_local(fb, local))
+                    return 1;
+                return 0;
+            }
+            else
+            {
+                // global
+                if (!ccb_emit_load_global(&fb->body, target->var_ref))
+                    return 1;
+                if (!string_list_appendf(&fb->body, "  call __cert__delete void (ptr)"))
+                    return 1;
+                if (!ccb_emit_const_zero(&fb->body, CC_TYPE_PTR))
+                    return 1;
+                if (!ccb_emit_store_global(&fb->body, target->var_ref))
+                    return 1;
+                return 0;
+            }
+        }
+
+        if (target->kind == ND_DEREF || target->kind == ND_INDEX || target->kind == ND_MEMBER)
+        {
+            CCValueType elem_ty = CC_TYPE_PTR;
+            const Type *elem_type = NULL;
+            // Compute address and stash it in a temp local
+            CcbLocal *addr_local = ccb_local_add(fb, NULL, type_ptr(type_void()), false, false);
+            if (!addr_local)
+                return 1;
+
+            if (target->kind == ND_DEREF)
+            {
+                if (ccb_emit_deref_address(fb, target, &elem_ty, &elem_type))
+                    return 1;
+            }
+            else if (target->kind == ND_INDEX)
+            {
+                if (ccb_emit_index_address(fb, target, &elem_ty, &elem_type))
+                    return 1;
+            }
+            else // ND_MEMBER
+            {
+                if (ccb_emit_member_address(fb, target, &elem_ty, &elem_type))
+                    return 1;
+            }
+
+            if (!ccb_emit_store_local(fb, addr_local))
+                return 1;
+
+            // load the pointer from address, call free
+            if (!ccb_emit_load_local(fb, addr_local))
+                return 1;
+            if (!ccb_emit_load_indirect(&fb->body, CC_TYPE_PTR))
+                return 1;
+            if (!string_list_appendf(&fb->body, "  call __cert__delete void (ptr)"))
+                return 1;
+
+            // store null back through the address
+            if (!ccb_emit_load_local(fb, addr_local))
+                return 1;
+            if (!ccb_emit_const_zero(&fb->body, CC_TYPE_PTR))
+                return 1;
+            if (!ccb_emit_store_indirect(&fb->body, CC_TYPE_PTR))
+                return 1;
+            return 0;
+        }
+
+        // Fallback: evaluate expression, call free
+        if (ccb_emit_expr_basic(fb, stmt->lhs))
+            return 1;
+        if (!string_list_appendf(&fb->body, "  call __cert__delete void (ptr)"))
+            return 1;
+        return 0;
+    }
     case ND_SEQ:
     {
         if (ccb_emit_expr_basic(fb, stmt))
@@ -8323,8 +8493,28 @@ static int ccb_function_emit_basic(CcbModule *mod, const Node *fn, const Codegen
     bool enable_debug = mod && mod->emit_debug;
     ccb_function_builder_init(&fb, mod, fn, enable_debug);
     ccb_function_builder_register_params(&fb);
+    int rc = 0;
 
-    int rc;
+    // If this function is the entry point, arrange for GC prep calls.
+    if (fn->is_entrypoint)
+    {
+        if (!ccb_module_has_function(mod, "__cert__GC__prep_enter") && !ccb_module_has_extern(mod, "__cert__GC__prep_enter"))
+        {
+            if (!ccb_module_appendf(mod, ".extern __cert__GC__prep_enter params=() returns=void"))
+                rc = 1;
+        }
+        if (!ccb_module_has_function(mod, "__cert__GC__prep_exit") && !ccb_module_has_extern(mod, "__cert__GC__prep_exit"))
+        {
+            if (!ccb_module_appendf(mod, ".extern __cert__GC__prep_exit params=() returns=void"))
+                rc = 1;
+        }
+
+        if (rc == 0)
+        {
+            if (!string_list_appendf(&fb.prologue, "  call __cert__GC__prep_enter void ()"))
+                rc = 1;
+        }
+    }
     if (fn->body && fn->body->kind == ND_BLOCK)
         rc = ccb_emit_block(&fb, fn->body, false);
     else
