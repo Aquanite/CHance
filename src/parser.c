@@ -842,6 +842,17 @@ static void apply_function_attributes(Parser *ps, Node *fn, struct PendingAttr *
         {
             fn->wants_inline = 1;
         }
+        else if (strcmp(attr->name, "Hint") == 0)
+        {
+            /* Hints are handled by the preprocessor/parser for enabling region-scoped
+             * behaviors (e.g. implicit-void-function). Accept and ignore here. */
+            continue;
+        }
+        else if (strcmp(attr->name, "NoHint") == 0)
+        {
+            /* NoHint is similarly ignored at this stage. */
+            continue;
+        }
         else
         {
             diag_error_at(lexer_source(ps->lx), attr->line, attr->col,
@@ -1934,6 +1945,361 @@ static void parse_trailing_funptr_signature(Parser *ps, Type *ty)
         func_ty->func.ret = parse_type_spec(ps);
     }
     finalize_funptr_signature(ps, func_ty, &next);
+}
+
+static Type *parse_type_base(Parser *ps)
+{
+    if (!ps)
+        return NULL;
+    // allow leading qualifiers like 'constant' and optional 'stack'
+    int consumed_stack = 0;
+    while (1)
+    {
+        Token t = lexer_peek(ps->lx);
+        if (t.kind == TK_KW_CONSTANT)
+        {
+            lexer_next(ps->lx);
+            continue;
+        }
+        if (!consumed_stack && t.kind == TK_KW_STACK)
+        {
+            lexer_next(ps->lx);
+            consumed_stack = 1;
+            continue;
+        }
+        break;
+    }
+    Type *base = NULL;
+    Token b = lexer_next(ps->lx);
+    static Type ti8 = {.kind = TY_I8}, tu8 = {.kind = TY_U8},
+                ti16 = {.kind = TY_I16}, tu16 = {.kind = TY_U16},
+                ti32 = {.kind = TY_I32}, tu32 = {.kind = TY_U32},
+                ti64 = {.kind = TY_I64}, tu64 = {.kind = TY_U64};
+    static Type tf32 = {.kind = TY_F32}, tf64 = {.kind = TY_F64},
+                tf128 = {.kind = TY_F128};
+    static Type tv = {.kind = TY_VOID}, tch = {.kind = TY_CHAR}, tbool = {.kind = TY_BOOL};
+    if (b.kind == TK_KW_I8)
+        base = &ti8;
+    else if (b.kind == TK_KW_U8)
+        base = &tu8;
+    else if (b.kind == TK_KW_I16 || b.kind == TK_KW_SHORT)
+        base = &ti16;
+    else if (b.kind == TK_KW_U16 || b.kind == TK_KW_USHORT)
+        base = &tu16;
+    else if (b.kind == TK_KW_I32 || b.kind == TK_KW_INT)
+        base = &ti32;
+    else if (b.kind == TK_KW_U32 || b.kind == TK_KW_UINT)
+        base = &tu32;
+    else if (b.kind == TK_KW_BYTE)
+        base = &ti8;
+    else if (b.kind == TK_KW_UBYTE)
+        base = &tu8;
+    else if (b.kind == TK_KW_I64 || b.kind == TK_KW_LONG)
+        base = &ti64;
+    else if (b.kind == TK_KW_U64 || b.kind == TK_KW_ULONG)
+        base = &tu64;
+    else if (b.kind == TK_KW_F32 || b.kind == TK_KW_FLOAT)
+        base = &tf32;
+    else if (b.kind == TK_KW_DOUBLE)
+    {
+        // could be 'double' or part of 'long double' handled when previous token
+        // was LONG; since we consumed, treat as f64 here
+        base = &tf64;
+    }
+    else if (b.kind == TK_KW_F64)
+        base = &tf64;
+    else if (b.kind == TK_KW_F128)
+        base = &tf128;
+    else if (b.kind == TK_KW_VOID)
+        base = &tv;
+    else if (b.kind == TK_KW_CHAR)
+        base = &tch;
+    else if (b.kind == TK_KW_BOOL)
+        base = &tbool;
+    else if (b.kind == TK_KW_LONG)
+    {
+        // check for 'long double'
+        Token p = lexer_peek(ps->lx);
+        if (p.kind == TK_KW_DOUBLE)
+        {
+            lexer_next(ps->lx);
+            base = &tf128;
+        }
+        else
+            base = &ti64;
+    }
+    else if (b.kind == TK_KW_FUN)
+    {
+        Token star = lexer_peek(ps->lx);
+        if (star.kind != TK_STAR)
+        {
+            diag_error_at(lexer_source(ps->lx), star.line, star.col,
+                          "expected '*' after 'fun' in function pointer type");
+            exit(1);
+        }
+        lexer_next(ps->lx); // consume '*'
+        Type *func_ty = type_func();
+        Token after_star = lexer_peek(ps->lx);
+        if (after_star.kind == TK_LPAREN)
+        {
+            int ret_inside = parse_funptr_signature_parens(ps, func_ty, 1);
+            if (!ret_inside)
+            {
+                Token arrow = lexer_peek(ps->lx);
+                if (arrow.kind != TK_ARROW)
+                {
+                    diag_error_at(lexer_source(ps->lx), arrow.line, arrow.col,
+                                  "function pointer type requires '->' return type");
+                    exit(1);
+                }
+                lexer_next(ps->lx);
+                func_ty->func.ret = parse_type_spec(ps);
+            }
+            finalize_funptr_signature(ps, func_ty, &after_star);
+        }
+        base = type_ptr(func_ty);
+    }
+    else if (b.kind == TK_KW_ACTION)
+    {
+        Type *func_ty = type_func();
+        Token maybe_lparen = lexer_peek(ps->lx);
+        if (maybe_lparen.kind == TK_LPAREN)
+        {
+            int ret_inside = parse_funptr_signature_parens(ps, func_ty, 1);
+            if (!ret_inside)
+            {
+                Token arrow = lexer_peek(ps->lx);
+                if (arrow.kind != TK_ARROW)
+                {
+                    diag_error_at(lexer_source(ps->lx), arrow.line, arrow.col,
+                                  "action type requires '->' return type when signature is present");
+                    exit(1);
+                }
+                lexer_next(ps->lx);
+                func_ty->func.ret = parse_type_spec(ps);
+            }
+            finalize_funptr_signature(ps, func_ty, &maybe_lparen);
+        }
+        base = type_ptr(func_ty);
+    }
+    else if (b.kind == TK_IDENT)
+    {
+        Token local_buf[8];
+        Token *tokens = local_buf;
+        int token_count = 0;
+        int token_cap = (int)(sizeof(local_buf) / sizeof(local_buf[0]));
+        tokens[token_count++] = b;
+        Token dot = lexer_peek(ps->lx);
+        while (dot.kind == TK_DOT)
+        {
+            lexer_next(ps->lx);
+            Token next_ident = expect(ps, TK_IDENT, "identifier");
+            if (token_count == token_cap)
+            {
+                token_cap *= 2;
+                Token *grown = (Token *)xmalloc((size_t)token_cap * sizeof(Token));
+                memcpy(grown, tokens, (size_t)token_count * sizeof(Token));
+                if (tokens != local_buf)
+                    free(tokens);
+                tokens = grown;
+            }
+            tokens[token_count++] = next_ident;
+            dot = lexer_peek(ps->lx);
+        }
+
+        if (token_count >= 2)
+        {
+            int module_parts = token_count - 1;
+            Token *module_tokens = tokens;
+            Token type_tok = tokens[token_count - 1];
+            const struct ModuleImport *imp = NULL;
+            if (module_parts == 1)
+                imp = parser_find_import_by_alias(ps, module_tokens[0].lexeme, module_tokens[0].length);
+            if (!imp)
+                imp = parser_find_import_by_parts(ps, module_tokens, module_parts);
+            const char *module_full = imp ? imp->full_name : NULL;
+            if (!module_full && parser_module_tokens_match_current(ps, module_tokens, module_parts))
+                module_full = ps->module_full_name;
+            if (!module_full)
+            {
+                size_t total_len = 0;
+                for (int i = 0; i < module_parts; ++i)
+                    total_len += (size_t)module_tokens[i].length + 1;
+                char *module_name = (char *)xmalloc(total_len + 1);
+                size_t pos = 0;
+                for (int i = 0; i < module_parts; ++i)
+                {
+                    memcpy(module_name + pos, module_tokens[i].lexeme, (size_t)module_tokens[i].length);
+                    pos += (size_t)module_tokens[i].length;
+                    if (i + 1 < module_parts)
+                        module_name[pos++] = '.';
+                }
+                module_name[pos] = '\0';
+                diag_error_at(lexer_source(ps->lx), b.line, b.col,
+                              "unknown module '%s' for qualified type", module_name);
+                free(module_name);
+                if (tokens != local_buf)
+                    free(tokens);
+                exit(1);
+            }
+
+            char *type_name = (char *)xmalloc((size_t)type_tok.length + 1);
+            memcpy(type_name, type_tok.lexeme, (size_t)type_tok.length);
+            type_name[type_tok.length] = '\0';
+
+            Type *resolved = module_registry_lookup_struct(module_full, type_name);
+            if (!resolved)
+                resolved = module_registry_lookup_enum(module_full, type_name);
+            if (resolved)
+            {
+                base = resolved;
+                free(type_name);
+            }
+            else
+            {
+                Type *imp_type = (Type *)xcalloc(1, sizeof(Type));
+                imp_type->kind = TY_IMPORT;
+                imp_type->struct_name = type_name;
+                imp_type->import_module = xstrdup(module_full);
+                imp_type->import_type_name = type_name;
+                base = imp_type;
+            }
+
+            if (tokens != local_buf)
+                free(tokens);
+        }
+        else
+        {
+            if (b.length == 7 && strncmp(b.lexeme, "va_list", 7) == 0)
+            {
+                base = type_va_list();
+            }
+            else
+            {
+                Type *generic_param = parser_lookup_generic_param(ps, &b);
+                if (generic_param)
+                {
+                    base = generic_param;
+                }
+                else
+                {
+                    int ai = alias_find(ps, b.lexeme, b.length);
+                    if (ai < 0)
+                    {
+                        Type *nt = named_type_get(ps, b.lexeme, b.length);
+                        if (nt)
+                            base = nt;
+                        else
+                        {
+                            diag_error_at(lexer_source(ps->lx), b.line, b.col, "unknown type '%.*s'",
+                                          b.length, b.lexeme);
+                            exit(1);
+                        }
+                    }
+                    if (ai >= 0)
+                    {
+                        struct Alias *A = &ps->aliases[ai];
+                        if (A->is_generic)
+                        {
+                            Token lt = lexer_next(ps->lx);
+                            if (lt.kind != TK_LT)
+                            {
+                                diag_error_at(lexer_source(ps->lx), lt.line, lt.col,
+                                              "expected '<' after generic alias '%.*s'", b.length,
+                                              b.lexeme);
+                                exit(1);
+                            }
+                            Type *arg = parse_type_spec(ps);
+                            Token gt = lexer_next(ps->lx);
+                            if (gt.kind != TK_GT)
+                            {
+                                diag_error_at(lexer_source(ps->lx), gt.line, gt.col,
+                                              "expected '>' after generic argument");
+                                exit(1);
+                            }
+                            base = make_ptr_chain_dyn(arg, A->gen_ptr_depth);
+                        }
+                        else
+                        {
+                            if (A->resolved_type)
+                            {
+                                base = A->resolved_type;
+                            }
+                            else
+                            {
+                                Type *bk = NULL;
+                                switch (A->base_kind)
+                                {
+                                case TY_I8:
+                                    bk = &ti8;
+                                    break;
+                                case TY_U8:
+                                    bk = &tu8;
+                                    break;
+                                case TY_I16:
+                                    bk = &ti16;
+                                    break;
+                                case TY_U16:
+                                    bk = &tu16;
+                                    break;
+                                case TY_I32:
+                                    bk = &ti32;
+                                    break;
+                                case TY_U32:
+                                    bk = &tu32;
+                                    break;
+                                case TY_I64:
+                                    bk = &ti64;
+                                    break;
+                                case TY_U64:
+                                    bk = &tu64;
+                                    break;
+                                case TY_F32:
+                                    bk = &tf32;
+                                    break;
+                                case TY_F64:
+                                    bk = &tf64;
+                                    break;
+                                case TY_F128:
+                                    bk = &tf128;
+                                    break;
+                                case TY_VOID:
+                                    bk = &tv;
+                                    break;
+                                case TY_CHAR:
+                                    bk = &tch;
+                                    break;
+                                default:
+                                    diag_error("unsupported alias base kind");
+                                    exit(1);
+                                }
+                                base = make_ptr_chain_dyn(bk, A->ptr_depth);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else if (b.kind == TK_KW_STRUCT)
+    {
+        // allow 'struct Name' as a type use
+        Token nm = expect(ps, TK_IDENT, "struct name");
+        Type *nt = named_type_get(ps, nm.lexeme, nm.length);
+        if (!nt)
+        {
+            diag_error_at(lexer_source(ps->lx), nm.line, nm.col, "unknown struct '%.*s'", nm.length, nm.lexeme);
+            exit(1);
+        }
+        base = nt;
+    }
+    else
+    {
+        diag_error_at(lexer_source(ps->lx), b.line, b.col,
+                      "expected type specifier");
+        exit(1);
+    }
+    return base;
 }
 
 static Type *parse_type_spec(Parser *ps)
@@ -3511,7 +3877,7 @@ static Node *parse_unary(Parser *ps)
     if (p.kind == TK_KW_NEW)
     {
         lexer_next(ps->lx);
-        Type *ty = parse_type_spec(ps);
+        Type *ty = parse_type_base(ps);
         Node *n = new_node(ND_NEW);
         // If the parsed type was an array type (e.g., 'int[5]'),
         // treat that array length as the count for the 'new' expression
@@ -4214,6 +4580,126 @@ static Node *parse_block(Parser *ps)
     for (;;)
     {
         Token t = lexer_peek(ps->lx);
+
+        // Handle preprocessor-inserted hint markers emitted by chance_preprocess_source
+        if (t.kind == TK_IDENT && t.lexeme && t.length > 0)
+        {
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_VOID_FUNCTION__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_VOID_FUNCTION__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_void_function(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_VOID_FUNCTION__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_VOID_FUNCTION__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_void_function(0);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_SIZEOF__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_SIZEOF__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_sizeof(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_SIZEOF__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_SIZEOF__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_sizeof(0);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_VOIDP__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_VOIDP__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_voidp(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_VOIDP__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_VOIDP__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_voidp(0);
+                continue;
+            }
+        }
+
+        // Handle preprocessor-inserted hint markers emitted by chance_preprocess_source
+        if (t.kind == TK_IDENT && t.lexeme && t.length > 0)
+        {
+            // compare known marker names
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_VOID_FUNCTION__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_VOID_FUNCTION__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                // consume trailing semicolon if present
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_void_function(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_VOID_FUNCTION__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_VOID_FUNCTION__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_void_function(0);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_SIZEOF__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_SIZEOF__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_sizeof(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_SIZEOF__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_SIZEOF__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_sizeof(0);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_VOIDP__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_VOIDP__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_voidp(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_VOIDP__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_VOIDP__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_voidp(0);
+                continue;
+            }
+        }
         if (t.kind == TK_RBRACE)
         {
             lexer_next(ps->lx);
@@ -4587,7 +5073,7 @@ static Node *parse_for(Parser *ps)
     return wh;
 }
 
-static Node *parse_function(Parser *ps, int is_noreturn, int is_exposed, FunctionBodyKind body_kind)
+static Node *parse_function(Parser *ps, int is_noreturn, int is_exposed, FunctionBodyKind body_kind, struct PendingAttr *attrs, int attr_count)
 {
     expect(ps, TK_KW_FUN, "fun");
     Token name = expect(ps, TK_IDENT, "identifier");
@@ -4719,9 +5205,37 @@ static Node *parse_function(Parser *ps, int is_noreturn, int is_exposed, Functio
         }
     }
     expect(ps, TK_RPAREN, ")");
-    expect(ps, TK_ARROW, "->");
-    // return type
-    Type *rtype = parse_type_spec(ps);
+    Token arrow_peek = lexer_peek(ps->lx);
+    Type *rtype = NULL;
+    int allow_implicit_for_this = 0;
+    if (attrs && attr_count > 0)
+    {
+        for (int i = 0; i < attr_count; ++i)
+        {
+            if (!attrs[i].name)
+                continue;
+            if (strcmp(attrs[i].name, "Hint") == 0 && attrs[i].value && strcmp(attrs[i].value, "implicit-void-function") == 0)
+            {
+                allow_implicit_for_this = 1;
+                break;
+            }
+        }
+    }
+    if (arrow_peek.kind == TK_ARROW)
+    {
+        lexer_next(ps->lx);
+        // return type
+        rtype = parse_type_spec(ps);
+    }
+    else if (allow_implicit_for_this || sema_get_allow_implicit_void_function())
+    {
+        rtype = type_void();
+    }
+    else
+    {
+        expect(ps, TK_ARROW, "->");
+        // unreachable: expect will exit
+    }
     if (is_noreturn && rtype && rtype->kind != TY_VOID)
     {
         diag_error_at(lexer_source(ps->lx), name.line, name.col,
@@ -5100,6 +5614,65 @@ Node *parse_unit(Parser *ps)
     {
         Token t = lexer_peek(ps->lx);
 
+        // Handle preprocessor-inserted hint markers emitted by chance_preprocess_source
+        if (t.kind == TK_IDENT && t.lexeme && t.length > 0)
+        {
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_VOID_FUNCTION__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_VOID_FUNCTION__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_void_function(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_VOID_FUNCTION__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_VOID_FUNCTION__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_void_function(0);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_SIZEOF__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_SIZEOF__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_sizeof(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_SIZEOF__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_SIZEOF__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_sizeof(0);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_START_IMPLICIT_VOIDP__") && strncmp(t.lexeme, "__CHANCE_HINT_START_IMPLICIT_VOIDP__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_voidp(1);
+                continue;
+            }
+            if (t.length == (int)strlen("__CHANCE_HINT_END_IMPLICIT_VOIDP__") && strncmp(t.lexeme, "__CHANCE_HINT_END_IMPLICIT_VOIDP__", t.length) == 0)
+            {
+                lexer_next(ps->lx);
+                Token semi = lexer_peek(ps->lx);
+                if (semi.kind == TK_SEMI)
+                    lexer_next(ps->lx);
+                sema_set_allow_implicit_voidp(0);
+                continue;
+            }
+        }
+
         while (t.kind == TK_LBRACKET)
         {
             struct PendingAttr attr = parse_attribute(ps);
@@ -5334,7 +5907,8 @@ Node *parse_unit(Parser *ps)
                 body_kind = FN_BODY_CHANCECODE;
             else if (has_literal)
                 body_kind = FN_BODY_LITERAL;
-            Node *fn = parse_function(ps, leading_noreturn, visibility, body_kind);
+            (void)0;
+            Node *fn = parse_function(ps, leading_noreturn, visibility, body_kind, attrs, attr_count);
             apply_function_attributes(ps, fn, attrs, attr_count);
             clear_pending_attrs(attrs, attr_count);
             attr_count = 0;

@@ -10,6 +10,7 @@
 
 static int sema_allow_implicit_voidp = 0;
 static int sema_allow_implicit_sizeof = 0;
+static int sema_allow_implicit_void_function = 0;
 
 void sema_set_allow_implicit_voidp(int enable)
 {
@@ -19,6 +20,16 @@ void sema_set_allow_implicit_voidp(int enable)
 void sema_set_allow_implicit_sizeof(int enable)
 {
     sema_allow_implicit_sizeof = enable ? 1 : 0;
+}
+
+void sema_set_allow_implicit_void_function(int enable)
+{
+    sema_allow_implicit_void_function = enable ? 1 : 0;
+}
+
+int sema_get_allow_implicit_void_function(void)
+{
+    return sema_allow_implicit_void_function;
 }
 
 enum

@@ -651,5 +651,7 @@ Symbol *sema_copy_imported_function_symbols(const SemaContext *sc, int *out_coun
 Symbol *sema_copy_imported_global_symbols(const SemaContext *sc, int *out_count);
 void sema_set_allow_implicit_voidp(int enable);
 void sema_set_allow_implicit_sizeof(int enable);
+void sema_set_allow_implicit_void_function(int enable);
+int sema_get_allow_implicit_void_function(void);
 
 #endif // CHANCE_AST_H

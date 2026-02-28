@@ -1788,6 +1788,82 @@ static int handle_directive(PreprocState *st, const char *src, int len, int *ind
 		free(name);
 		push_condition(st, current_active(st), cond);
 	}
+	if (strcmp(keyword, "hint") == 0)
+	{
+		if (active)
+		{
+			(void)directive_arg; (void)line_no; (void)active;
+			// parse tokens in directive_arg and emit start markers into output
+			size_t pos = 0;
+			int emitted = 0;
+			while (pos < directive_arg_len)
+			{
+				// skip separators
+				while (pos < directive_arg_len && (directive_arg[pos] == ' ' || directive_arg[pos] == '\t' || directive_arg[pos] == ','))
+					pos++;
+				if (pos >= directive_arg_len) break;
+				size_t start = pos;
+				while (pos < directive_arg_len && (is_ident_char(directive_arg[pos]) || directive_arg[pos] == '-')) pos++;
+				size_t end = pos;
+				if (end <= start) break;
+				char *tok = copy_trimmed(directive_arg, start, end);
+				if (strcmp(tok, "implicit-void-function") == 0)
+				{
+					sb_append_str(out, "__CHANCE_HINT_START_IMPLICIT_VOID_FUNCTION__");
+					emitted = 1;
+				}
+				else if (strcmp(tok, "implicit-sizeof") == 0)
+				{
+					sb_append_str(out, "__CHANCE_HINT_START_IMPLICIT_SIZEOF__");
+					emitted = 1;
+				}
+				else if (strcmp(tok, "implicit-voidp") == 0)
+				{
+					sb_append_str(out, "__CHANCE_HINT_START_IMPLICIT_VOIDP__");
+					emitted = 1;
+				}
+				free(tok);
+			}
+			(void)emitted;
+		}
+	}
+	else if (strcmp(keyword, "nohint") == 0)
+	{
+		if (active)
+		{
+			(void)directive_arg; (void)line_no; (void)active;
+			// Emit end markers for hints so parser can turn off region behavior.
+			size_t pos = 0;
+			int emitted = 0;
+			while (pos < directive_arg_len)
+			{
+				while (pos < directive_arg_len && (directive_arg[pos] == ' ' || directive_arg[pos] == '\t' || directive_arg[pos] == ',')) pos++;
+				if (pos >= directive_arg_len) break;
+				size_t start = pos;
+				while (pos < directive_arg_len && (is_ident_char(directive_arg[pos]) || directive_arg[pos] == '-')) pos++;
+				size_t end = pos;
+				if (end <= start) break;
+				char *tok = copy_trimmed(directive_arg, start, end);
+				if (strcmp(tok, "implicit-void-function") == 0)
+				{
+					sb_append_str(out, "__CHANCE_HINT_END_IMPLICIT_VOID_FUNCTION__");
+					emitted = 1;
+				}
+				else if (strcmp(tok, "implicit-sizeof") == 0)
+				{
+					sb_append_str(out, "__CHANCE_HINT_END_IMPLICIT_SIZEOF__");
+					emitted = 1;
+				}
+				else if (strcmp(tok, "implicit-voidp") == 0)
+				{
+					sb_append_str(out, "__CHANCE_HINT_END_IMPLICIT_VOIDP__");
+					emitted = 1;
+				}
+				free(tok);
+			}
+			(void)emitted;
+		}
+	}
 	else if (strcmp(keyword, "if") == 0)
 		handle_if(st, directive_arg, directive_arg_len, *line_no);
 	else if (strcmp(keyword, "elif") == 0)
