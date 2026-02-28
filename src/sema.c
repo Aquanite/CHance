@@ -4723,7 +4723,37 @@ static void check_expr(SemaContext *sc, Node *e)
     }
     if (e->kind == ND_CAST)
     {
-        check_expr(sc, e->lhs); /* trust parser's target type on node */
+        check_expr(sc, e->lhs);
+        /* If parser provided a dynamic type expression (e.g. 'as typeof(x)'),
+           resolve it here without running the generic typeof->string lowering. */
+        if (!e->type && e->type_expr)
+        {
+            Node *te = e->type_expr;
+            if (te->kind == ND_TYPEOF)
+            {
+                Type *target = NULL;
+                if (te->var_type)
+                    target = te->var_type;
+                else if (te->lhs)
+                {
+                    check_expr(sc, te->lhs);
+                    target = te->lhs->type;
+                }
+                target = canonicalize_type_deep(target);
+                if (!target)
+                {
+                    diag_error_at(e->src, e->line, e->col, "typeof expression did not resolve to a type");
+                    exit(1);
+                }
+                e->type = target;
+                return;
+            }
+            else
+            {
+                diag_error_at(e->src, e->line, e->col, "invalid type expression after 'as'");
+                exit(1);
+            }
+        }
         if (!e->type)
             e->type = e->lhs->type;
         return;

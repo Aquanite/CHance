@@ -3259,15 +3259,32 @@ static Node *parse_postfix_suffixes(Parser *ps, Node *expr)
         if (p.kind == TK_KW_AS)
         {
             lexer_next(ps->lx);
-            Type *ty = parse_type_spec(ps);
-            Node *cs = new_node(ND_CAST);
-            cs->lhs = e;
-            cs->type = ty;
-            cs->line = p.line;
-            cs->col = p.col;
-            cs->src = lexer_source(ps->lx);
-            e = cs;
-            continue;
+            Token next = lexer_peek(ps->lx);
+            if (next.kind == TK_KW_TYPEOF)
+            {
+                Node *type_expr = parse_expr(ps);
+                Node *cs = new_node(ND_CAST);
+                cs->lhs = e;
+                cs->type = NULL;
+                cs->type_expr = type_expr;
+                cs->line = p.line;
+                cs->col = p.col;
+                cs->src = lexer_source(ps->lx);
+                e = cs;
+                continue;
+            }
+            else
+            {
+                Type *ty = parse_type_spec(ps);
+                Node *cs = new_node(ND_CAST);
+                cs->lhs = e;
+                cs->type = ty;
+                cs->line = p.line;
+                cs->col = p.col;
+                cs->src = lexer_source(ps->lx);
+                e = cs;
+                continue;
+            }
         }
         if (p.kind == TK_ACCESS || p.kind == TK_DOT || p.kind == TK_ARROW)
         {

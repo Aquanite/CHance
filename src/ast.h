@@ -354,6 +354,8 @@ struct Node
     const SourceBuffer *src;
     // Typed nodes
     Type *type; // inferred/declared type
+    // Optional expression used as a dynamic type (e.g. 'as typeof(x)')
+    struct Node *type_expr;
     // For ND_FUNC
     const char *name;
     struct Node *body; // single statement for now
