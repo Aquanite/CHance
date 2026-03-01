@@ -2,7 +2,27 @@ extend from "C" int printf(char* format, ...);
 extend from "C" void exit(int status);
 
 [Export]
-expose noreturn fun __cert__panic(char* message) -> void {
-    printf("__cert__panic: %s\n", message);
+expose noreturn fun __cert__runtime_error_ex(i32 code, char* category, char* message, char* file, u64 line, char* symbol) -> void {
+    printf("\n====== CHANCE RUNTIME ERROR ======\n");
+    printf("Code: 0x%X\n", code);
+    printf("Category: %s\n", category);
+    printf("Message: %s\n", message);
+    if (file != null) {
+        printf("Location: %s:%d\n", file, line);
+    }
+    if (symbol != null) {
+        printf("Symbol: %s\n", symbol);
+    }
+    printf("==================================\n");
     exit(1);
+}
+
+[Export]
+expose noreturn fun __cert__runtime_error(char* category, char* message) -> void {
+    __cert__runtime_error_ex(1, category, message, null, 0, null);
+}
+
+[Export]
+expose noreturn fun __cert__panic(char* message) -> void {
+    __cert__runtime_error_ex(1000, "Panic", message, null, 0, null);
 }

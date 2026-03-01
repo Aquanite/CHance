@@ -6,13 +6,13 @@ extend from "C" void* memset(void* s, i32 c, u64 n);
 extend from "C" u64 strlen(constant char* s);
 extend from "C" u64 strlen(constant char* s);
 
-extend fun __cert__panic(char* message) -> void;
+extend fun __cert__runtime_error(char* category, char* message) -> void;
 
 [Export]
 expose fun __cert__malloc(u64 size) -> void* {
     void* ptr = malloc(size);
     if (ptr == null) {
-        __cert__panic("Out of memory");
+        __cert__runtime_error("OutOfMemory", "malloc failed in runtime memory allocator");
     }
     ret ptr;
 }
@@ -28,7 +28,7 @@ expose fun __cert__free(void* ptr) -> void {
 expose fun __cert__realloc(void* ptr, u64 size) -> void* {
     void* new_ptr = realloc(ptr, size);
     if (new_ptr == null) {
-        __cert__panic("Out of memory");
+        __cert__runtime_error("OutOfMemory", "realloc failed in runtime memory allocator");
     }
     ret new_ptr;
 }

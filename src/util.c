@@ -301,6 +301,15 @@ Type *type_ptr(Type *to)
     return t;
 }
 
+Type *type_ref(Type *to, int nullability)
+{
+    Type *t = (Type *)xcalloc(1, sizeof(Type));
+    t->kind = TY_REF;
+    t->pointee = to;
+    t->ref_nullability = nullability;
+    return t;
+}
+
 Type *type_func(void)
 {
     Type *t = (Type *)xcalloc(1, sizeof(Type));
@@ -333,6 +342,8 @@ int type_equals(Type *a, Type *b)
         return 0;
     if (a->kind == TY_PTR)
         return type_equals(a->pointee, b->pointee);
+    if (a->kind == TY_REF)
+        return (b->kind == TY_REF) && (a->ref_nullability == b->ref_nullability) && type_equals(a->pointee, b->pointee);
     if (a->kind == TY_ARRAY)
     {
         if (a->array.length != b->array.length)

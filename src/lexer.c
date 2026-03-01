@@ -559,6 +559,8 @@ static Token lex_ident_or_kw(Lexer *lx)
         k = TK_KW_CHAR;
     else if (len == 4 && strncmp(p, "bool", 4) == 0)
         k = TK_KW_BOOL;
+    else if (len == 3 && strncmp(p, "ref", 3) == 0)
+        k = TK_KW_REF;
     else if (len == 3 && strncmp(p, "var", 3) == 0)
         k = TK_KW_VAR;
     else if (len == 4 && strncmp(p, "null", 4) == 0)

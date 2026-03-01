@@ -1762,6 +1762,8 @@ static int is_type_start(Parser *ps, Token t)
     case TK_KW_STACK:
     case TK_KW_ACTION:
         return 1;
+    case TK_KW_REF:
+        return 1;
     case TK_KW_FUN:
     {
         Token next = lexer_peek_n(ps->lx, 1);
@@ -1971,6 +1973,41 @@ static Type *parse_type_base(Parser *ps)
     }
     Type *base = NULL;
     Token b = lexer_next(ps->lx);
+    if (b.kind == TK_KW_REF)
+    {
+        int nullability = 0; // 0 = non-nullable, 1 = checked '?', 2 = unchecked '!'
+        Token look = lexer_peek(ps->lx);
+        if (look.kind == TK_QUESTION)
+        {
+            lexer_next(ps->lx);
+            nullability = 1;
+        }
+        else if (look.kind == TK_BANG)
+        {
+            lexer_next(ps->lx);
+            nullability = 2;
+        }
+        Type *pointee = parse_type_spec(ps);
+        return type_ref(pointee, nullability);
+    }
+    if (b.kind == TK_KW_REF)
+    {
+        int nullability = 0; // 0 = non-nullable, 1 = checked '?', 2 = unchecked '!'
+        Token look = lexer_peek(ps->lx);
+        if (look.kind == TK_QUESTION)
+        {
+            lexer_next(ps->lx);
+            nullability = 1;
+        }
+        else if (look.kind == TK_BANG)
+        {
+            lexer_next(ps->lx);
+            nullability = 2;
+        }
+        Type *pointee = parse_type_spec(ps);
+        return type_ref(pointee, nullability);
+    }
+    
     static Type ti8 = {.kind = TY_I8}, tu8 = {.kind = TY_U8},
                 ti16 = {.kind = TY_I16}, tu16 = {.kind = TY_U16},
                 ti32 = {.kind = TY_I32}, tu32 = {.kind = TY_U32},
@@ -2326,6 +2363,23 @@ static Type *parse_type_spec(Parser *ps)
     }
     Type *base = NULL;
     Token b = lexer_next(ps->lx);
+    if (b.kind == TK_KW_REF)
+    {
+        int nullability = 0; // 0 = non-nullable, 1 = checked '?', 2 = unchecked '!'
+        Token look = lexer_peek(ps->lx);
+        if (look.kind == TK_QUESTION)
+        {
+            lexer_next(ps->lx);
+            nullability = 1;
+        }
+        else if (look.kind == TK_BANG)
+        {
+            lexer_next(ps->lx);
+            nullability = 2;
+        }
+        Type *pointee = parse_type_spec(ps);
+        return type_ref(pointee, nullability);
+    }
     static Type ti8 = {.kind = TY_I8}, tu8 = {.kind = TY_U8},
                 ti16 = {.kind = TY_I16}, tu16 = {.kind = TY_U16},
                 ti32 = {.kind = TY_I32}, tu32 = {.kind = TY_U32},
@@ -3831,6 +3885,17 @@ static Node *parse_unary(Parser *ps)
         return n;
     }
     if (p.kind == TK_AMP)
+    {
+        lexer_next(ps->lx);
+        Node *lv = parse_unary(ps);
+        Node *n = new_node(ND_ADDR);
+        n->lhs = lv;
+        n->line = p.line;
+        n->col = p.col;
+        n->src = lexer_source(ps->lx);
+        return n;
+    }
+    if (p.kind == TK_KW_REF)
     {
         lexer_next(ps->lx);
         Node *lv = parse_unary(ps);
@@ -6096,7 +6161,7 @@ Node *parse_unit(Parser *ps)
             Node *fn = decls[i];
             if (!fn || fn->kind != ND_FUNC)
                 continue;
-            if (fn->metadata.backend_name || fn->is_entrypoint)
+            if (fn->metadata.backend_name || fn->is_entrypoint || fn->export_name)
                 continue;
             char *backend = NULL;
             if (ps->module_full_name && *ps->module_full_name)

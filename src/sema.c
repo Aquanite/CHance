@@ -70,7 +70,7 @@ static const Symbol *sema_resolve_local_overload(SemaContext *sc, const char *na
 static Type *canonicalize_type_deep(Type *ty)
 {
     ty = module_registry_canonical_type(ty);
-    if (ty && ty->kind == TY_PTR && ty->pointee)
+    if (ty && (ty->kind == TY_PTR || ty->kind == TY_REF) && ty->pointee)
     {
         Type *resolved = canonicalize_type_deep(ty->pointee);
         if (resolved && resolved != ty->pointee)
@@ -2109,13 +2109,16 @@ static void populate_symbol_from_function(Symbol *s, Node *fn)
 
     s->kind = SYM_FUNC;
     s->name = fn->name;
-    if (!fn->metadata.backend_name && !fn->is_entrypoint)
+    if (!fn->metadata.backend_name && !fn->is_entrypoint && !fn->export_name)
     {
         char *generated = append_param_signature(fn->name, fn);
         if (generated)
             fn->metadata.backend_name = generated;
     }
-    s->backend_name = fn->metadata.backend_name ? fn->metadata.backend_name : fn->name;
+    if (fn->export_name)
+        s->backend_name = fn->name;
+    else
+        s->backend_name = fn->metadata.backend_name ? fn->metadata.backend_name : fn->name;
     s->is_extern = 0;
     s->abi = "C";
     s->sig.is_varargs = fn->is_varargs ? 1 : 0;
@@ -2507,9 +2510,19 @@ static int type_is_pointer(Type *t)
     }
     if (t->kind == TY_PTR)
         return 1;
+    if (t->kind == TY_REF)
+        return 1;
     if (t->kind == TY_ARRAY && t->array.is_unsized)
         return 1;
     return 0;
+}
+
+static int type_is_ref(Type *t)
+{
+    t = canonicalize_type_deep(t);
+    if (!t)
+        return 0;
+    return t->kind == TY_REF;
 }
 
 static int type_is_function_pointer(const Type *t)
@@ -2784,6 +2797,32 @@ static int can_assign(Type *target, Node *rhs)
     {
         rhs->type = canon_target;
         return 1;
+    }
+    if (canon_target->kind == TY_REF)
+    {
+        /* Assigning to a reference variable can rebind from ptr/ref and (if nullable) null. */
+        Type *pointee = canonicalize_type_deep(canon_target->pointee);
+        Type *rhs_ty = canonicalize_type_deep(rhs->type);
+        if (rhs->kind == ND_NULL)
+        {
+            if (canon_target->ref_nullability != 0)
+            {
+                rhs->type = canon_target;
+                return 1;
+            }
+            return 0;
+        }
+        if (rhs_ty && rhs_ty->kind == TY_REF && rhs_ty->pointee && type_equal(rhs_ty->pointee, pointee))
+        {
+            rhs->type = canon_target;
+            return 1;
+        }
+        if (rhs_ty && rhs_ty->kind == TY_PTR && rhs_ty->pointee && type_equal(rhs_ty->pointee, pointee))
+        {
+            rhs->type = canon_target;
+            return 1;
+        }
+        return 0;
     }
     if (rhs->kind == ND_NEW)
     {
@@ -3642,6 +3681,7 @@ static Type *sema_prepare_assignment_lhs(SemaContext *sc, Node *assign_expr, Nod
             exit(1);
         }
     }
+
 
     if (out_lhs_base)
         *out_lhs_base = lhs_base;
@@ -4848,8 +4888,37 @@ static void check_expr(SemaContext *sc, Node *e)
     }
     if (e->kind == ND_ASSIGN)
     {
-        Type *lhs_type = sema_prepare_assignment_lhs(sc, e, NULL);
+        Node *lhs_base = NULL;
+        Type *lhs_type = sema_prepare_assignment_lhs(sc, e, &lhs_base);
         check_expr(sc, e->rhs);
+
+        Type *canon_lhs = canonicalize_type_deep(lhs_type);
+        if (lhs_base && lhs_base->kind == ND_VAR && canon_lhs && canon_lhs->kind == TY_REF)
+        {
+            Type *pointee = canonicalize_type_deep(canon_lhs->pointee);
+            Type *rhs_ty = canonicalize_type_deep(e->rhs ? e->rhs->type : NULL);
+            int is_rebind = 0;
+            if (e->rhs && e->rhs->kind == ND_NULL)
+                is_rebind = (canon_lhs->ref_nullability != 0);
+            else if (rhs_ty && rhs_ty->kind == TY_REF && rhs_ty->pointee && type_equal(rhs_ty->pointee, pointee))
+                is_rebind = 1;
+            else if (rhs_ty && rhs_ty->kind == TY_PTR && rhs_ty->pointee && type_equal(rhs_ty->pointee, pointee))
+                is_rebind = 1;
+
+            if (!is_rebind)
+            {
+                Node *deref = (Node *)xcalloc(1, sizeof(Node));
+                deref->kind = ND_DEREF;
+                deref->lhs = e->lhs;
+                deref->line = e->lhs ? e->lhs->line : e->line;
+                deref->col = e->lhs ? e->lhs->col : e->col;
+                deref->src = e->lhs ? e->lhs->src : e->src;
+                deref->type = pointee;
+                e->lhs = deref;
+                lhs_type = pointee;
+            }
+        }
+
         if (lhs_type)
         {
             if (!can_assign(lhs_type, e->rhs))
@@ -4900,7 +4969,23 @@ static void check_expr(SemaContext *sc, Node *e)
         e->kind == ND_BITOR_ASSIGN || e->kind == ND_BITXOR_ASSIGN || e->kind == ND_SHL_ASSIGN ||
         e->kind == ND_SHR_ASSIGN)
     {
-        Type *lhs_type = sema_prepare_assignment_lhs(sc, e, NULL);
+        Node *lhs_base = NULL;
+        Type *lhs_type = sema_prepare_assignment_lhs(sc, e, &lhs_base);
+        Type *canon_lhs = canonicalize_type_deep(lhs_type);
+        if (lhs_base && lhs_base->kind == ND_VAR && canon_lhs && canon_lhs->kind == TY_REF)
+        {
+            Type *pointee = canonicalize_type_deep(canon_lhs->pointee);
+            Node *deref = (Node *)xcalloc(1, sizeof(Node));
+            deref->kind = ND_DEREF;
+            deref->lhs = e->lhs;
+            deref->line = e->lhs ? e->lhs->line : e->line;
+            deref->col = e->lhs ? e->lhs->col : e->col;
+            deref->src = e->lhs ? e->lhs->src : e->src;
+            deref->type = pointee;
+            e->lhs = deref;
+            lhs_type = pointee;
+        }
+
         check_expr(sc, e->rhs);
         if (lhs_type)
         {
@@ -4918,7 +5003,7 @@ static void check_expr(SemaContext *sc, Node *e)
             e->rhs->type = lhs_type;
         }
 
-        Type *canon_lhs = canonicalize_type_deep(lhs_type);
+        canon_lhs = canonicalize_type_deep(lhs_type);
         int lhs_is_int = canon_lhs ? type_is_int(canon_lhs) : 0;
         int lhs_is_float = canon_lhs ? type_is_float(canon_lhs) : 0;
 
@@ -4968,60 +5053,75 @@ static void check_expr(SemaContext *sc, Node *e)
             allow_float = 0;
             break;
         default:
-            break;
-        }
-
-        const char *type_desc = (allow_int && allow_float) ? "integer or floating-point"
-                                                           : (allow_float ? "floating-point"
-                                                                          : "integer");
-        int lhs_acceptable = (allow_int && lhs_is_int) || (allow_float && lhs_is_float);
-        if (!lhs_acceptable)
-        {
-            diag_error_at(e->src, e->line, e->col,
-                          "%s requires %s operands", op_text, type_desc);
             exit(1);
         }
 
         e->type = lhs_type ? lhs_type : (e->rhs->type ? e->rhs->type : &ty_i32);
         return;
     }
+
     if (e->kind == ND_PREINC || e->kind == ND_PREDEC || e->kind == ND_POSTINC ||
         e->kind == ND_POSTDEC)
     {
-        // operand must be an lvalue variable of integer type (simplified)
         if (!e->lhs)
         {
             diag_error_at(e->src, e->line, e->col,
-                          "operand of ++/-- must be a variable");
+                          "operand of ++/-- must be an lvalue");
             exit(1);
         }
+
         check_expr(sc, e->lhs);
-        if (e->lhs->kind != ND_VAR)
+
+        if (e->lhs->kind == ND_VAR)
+        {
+            Type *lhs_ty = e->lhs->type;
+            if (!lhs_ty)
+                lhs_ty = resolve_variable(sc, e->lhs->var_ref, NULL, NULL, NULL, NULL);
+            lhs_ty = canonicalize_type_deep(lhs_ty);
+            if (lhs_ty && lhs_ty->kind == TY_REF)
+            {
+                Node *deref = (Node *)xcalloc(1, sizeof(Node));
+                deref->kind = ND_DEREF;
+                deref->lhs = e->lhs;
+                deref->line = e->lhs->line;
+                deref->col = e->lhs->col;
+                deref->src = e->lhs->src;
+                deref->type = canonicalize_type_deep(lhs_ty->pointee);
+                e->lhs = deref;
+            }
+        }
+
+        if (e->lhs->kind != ND_VAR && e->lhs->kind != ND_DEREF)
         {
             diag_error_at(e->src, e->line, e->col,
-                          "operand of ++/-- must be a variable");
+                          "operand of ++/-- must be a variable or dereference");
             exit(1);
         }
-        if (e->lhs->var_is_const)
+
+        if (e->lhs->kind == ND_VAR && e->lhs->var_is_const)
         {
             diag_error_at(e->lhs->src, e->lhs->line, e->lhs->col,
                           "cannot modify constant variable '%s'",
                           e->lhs->var_ref ? e->lhs->var_ref : "<unnamed>");
             exit(1);
         }
+
         Type *t = e->lhs->type;
-        if (!t)
+        if (!t && e->lhs->kind == ND_VAR)
             t = resolve_variable(sc, e->lhs->var_ref, NULL, NULL, NULL, NULL);
         t = canonicalize_type_deep(t);
         e->lhs->type = t;
         if (!t || (!type_is_int(t) && !type_is_pointer(t)))
         {
-            diag_error_at(e->src, e->line, e->col, "++/-- requires integer or pointer variable");
+            diag_error_at(e->src, e->line, e->col,
+                          "++/-- requires integer or pointer lvalue");
             exit(1);
         }
+
         e->type = t;
         return;
     }
+
     if (e->kind == ND_CALL)
     {
         Node *target = e->lhs;

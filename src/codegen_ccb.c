@@ -461,8 +461,16 @@ static void ccb_opt_prune_dropped_values(CcbFunctionBuilder *fb);
 static void ccb_opt_fold_const_binops(CcbFunctionBuilder *fb);
 static void ccb_opt_fold_const_unops(CcbFunctionBuilder *fb);
 static void ccb_opt_fold_const_compares(CcbFunctionBuilder *fb);
+static void ccb_opt_fold_const_test_null(CcbFunctionBuilder *fb);
 static void ccb_opt_fold_const_converts(CcbFunctionBuilder *fb);
 static void ccb_opt_simplify_store_load_store(CcbFunctionBuilder *fb);
+static void ccb_opt_propagate_local_values(CcbFunctionBuilder *fb);
+static void ccb_opt_remove_dead_local_stores(CcbFunctionBuilder *fb);
+static void ccb_opt_remove_dead_local_copies(CcbFunctionBuilder *fb);
+static void ccb_opt_simplify_addr_local_temp(CcbFunctionBuilder *fb);
+static void ccb_opt_simplify_const_branches(CcbFunctionBuilder *fb);
+static void ccb_opt_remove_redundant_jumps(CcbFunctionBuilder *fb);
+static void ccb_opt_remove_unused_labels(CcbFunctionBuilder *fb);
 static void ccb_opt_inline_const_str_locals(CcbFunctionBuilder *fb);
 static const char *ccb_trim_leading_ws(const char *line);
 static const char *ccb_binop_symbol(const char *op);
@@ -477,6 +485,9 @@ static void ccb_module_init(CcbModule *mod)
     string_list_init(&mod->defined_funcs);
     mod->emit_debug = false;
 }
+
+// forward declarations
+static bool ccb_emit_addr_global(StringList *body, const char *name);
 
 static void ccb_module_free(CcbModule *mod)
 {
@@ -1253,6 +1264,8 @@ static bool ccb_instruction_is_pure(const char *line)
         return true;
     if (strncmp(line, "compare ", 8) == 0)
         return true;
+    if (strncmp(line, "test_null", 9) == 0)
+        return true;
     if (strncmp(line, "unop ", 5) == 0)
         return true;
     if (strncmp(line, "dup", 3) == 0)
@@ -1668,6 +1681,25 @@ static bool ccb_parse_branch_targets(const char *line, char *true_label,
         false_label[pos++] = *cursor++;
     false_label[pos] = '\0';
     return true_label[0] != '\0' && false_label[0] != '\0';
+}
+
+static bool ccb_parse_jump_target(const char *line, char *out, size_t outsz)
+{
+    if (!line || !out || outsz == 0)
+        return false;
+    line = ccb_trim_leading_ws(line);
+    if (strncmp(line, "jump ", 5) != 0)
+        return false;
+    const char *cursor = line + 5;
+    while (*cursor == ' ' || *cursor == '\t')
+        ++cursor;
+    if (*cursor == '\0')
+        return false;
+    size_t pos = 0;
+    while (*cursor && !isspace((unsigned char)*cursor) && pos + 1 < outsz)
+        out[pos++] = *cursor++;
+    out[pos] = '\0';
+    return pos > 0;
 }
 
 static bool ccb_parse_zero_store_at_offset(const StringList *body, size_t index,
@@ -2146,6 +2178,53 @@ static void ccb_opt_fold_const_compares(CcbFunctionBuilder *fb)
         free(body->items[i]);
         body->items[i] = replacement;
         string_list_remove_range(body, i + 1, 2);
+        if (i > 0)
+            --i;
+    }
+}
+
+static void ccb_opt_fold_const_test_null(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i + 1 < body->count)
+    {
+        CcbConstInfo value;
+        if (!ccb_parse_const_info(body->items[i], &value))
+        {
+            ++i;
+            continue;
+        }
+
+        const char *line1 = ccb_trim_leading_ws(body->items[i + 1]);
+        if (!line1 || strcmp(line1, "test_null") != 0)
+        {
+            ++i;
+            continue;
+        }
+
+        bool is_null = (value.u & ccb_mask_for_width(value.width)) == 0ULL;
+
+        char new_line[64];
+        ccb_format_const_line(new_line, sizeof(new_line), "i1",
+                              is_null ? 1ULL : 0ULL,
+                              is_null ? 1LL : 0LL);
+
+        size_t new_len = strlen(new_line);
+        char *replacement = (char *)malloc(new_len + 1);
+        if (!replacement)
+        {
+            ++i;
+            continue;
+        }
+        memcpy(replacement, new_line, new_len + 1);
+
+        free(body->items[i]);
+        body->items[i] = replacement;
+        string_list_remove_range(body, i + 1, 1);
         if (i > 0)
             --i;
     }
@@ -2689,6 +2768,408 @@ static void ccb_opt_inline_const_str_locals(CcbFunctionBuilder *fb)
     }
 }
 
+static bool ccb_instruction_is_control_barrier(const char *line)
+{
+    line = ccb_trim_leading_ws(line);
+    if (!line || *line == '\0')
+        return true;
+    return strncmp(line, "label ", 6) == 0 ||
+           strncmp(line, "jump ", 5) == 0 ||
+           strncmp(line, "branch ", 7) == 0 ||
+           strncmp(line, "ret", 3) == 0;
+}
+
+static bool ccb_instruction_is_terminator(const char *line)
+{
+    line = ccb_trim_leading_ws(line);
+    if (!line || *line == '\0')
+        return false;
+    return strncmp(line, "jump ", 5) == 0 ||
+           strncmp(line, "branch ", 7) == 0 ||
+           strncmp(line, "ret", 3) == 0;
+}
+
+static void ccb_opt_propagate_local_values(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    if (body->count < 2)
+        return;
+
+    for (size_t i = 0; i + 1 < body->count; ++i)
+    {
+        CcbConstInfo cinfo;
+        int const_store_idx = -1;
+        if (ccb_parse_const_info(body->items[i], &cinfo) &&
+            ccb_parse_local_index(body->items[i + 1], "store_local", &const_store_idx))
+        {
+            char const_line[128];
+            ccb_format_const_line(const_line, sizeof(const_line), cinfo.type, cinfo.u, cinfo.s);
+            for (size_t j = i + 2; j < body->count; ++j)
+            {
+                const char *line = body->items[j];
+                if (ccb_instruction_is_control_barrier(line))
+                    break;
+
+                int idx = -1;
+                if (ccb_parse_local_index(line, "store_local", &idx) && idx == const_store_idx)
+                    break;
+                if (ccb_parse_local_index(line, "addr_local", &idx) && idx == const_store_idx)
+                    break;
+                if (ccb_parse_local_index(line, "load_local", &idx) && idx == const_store_idx)
+                    ccb_replace_linef(body, j, "%s", const_line);
+            }
+        }
+
+        int src_idx = -1;
+        int dst_idx = -1;
+        if (!ccb_parse_local_index(body->items[i], "load_local", &src_idx) ||
+            !ccb_parse_local_index(body->items[i + 1], "store_local", &dst_idx) ||
+            src_idx == dst_idx)
+        {
+            continue;
+        }
+
+        for (size_t j = i + 2; j < body->count; ++j)
+        {
+            const char *line = body->items[j];
+            if (ccb_instruction_is_control_barrier(line))
+                break;
+
+            int idx = -1;
+            if (ccb_parse_local_index(line, "store_local", &idx) && (idx == src_idx || idx == dst_idx))
+                break;
+            if (ccb_parse_local_index(line, "addr_local", &idx) && (idx == src_idx || idx == dst_idx))
+                break;
+            if (ccb_parse_local_index(line, "load_local", &idx) && idx == dst_idx)
+                ccb_replace_linef(body, j, "  load_local %d", src_idx);
+        }
+    }
+}
+
+static void ccb_opt_remove_dead_local_stores(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i < body->count)
+    {
+        int store_idx = -1;
+        if (!ccb_parse_local_index(body->items[i], "store_local", &store_idx))
+        {
+            ++i;
+            continue;
+        }
+
+        bool used = false;
+        bool overwritten = false;
+        bool hit_barrier = false;
+
+        for (size_t j = i + 1; j < body->count; ++j)
+        {
+            const char *line = body->items[j];
+            const char *trimmed = ccb_trim_leading_ws(line);
+            if (trimmed && (strncmp(trimmed, "label ", 6) == 0 ||
+                            strncmp(trimmed, "jump ", 5) == 0 ||
+                            strncmp(trimmed, "branch ", 7) == 0))
+            {
+                hit_barrier = true;
+                break;
+            }
+            if (trimmed && strncmp(trimmed, "ret", 3) == 0)
+            {
+                hit_barrier = true;
+                break;
+            }
+
+            int idx = -1;
+            if ((ccb_parse_local_index(line, "load_local", &idx) ||
+                 ccb_parse_local_index(line, "addr_local", &idx)) &&
+                idx == store_idx)
+            {
+                used = true;
+                break;
+            }
+
+            if (ccb_parse_local_index(line, "store_local", &idx) && idx == store_idx)
+            {
+                overwritten = true;
+                break;
+            }
+        }
+
+        if (used)
+        {
+            ++i;
+            continue;
+        }
+
+        if (hit_barrier && !overwritten)
+        {
+            ++i;
+            continue;
+        }
+
+        size_t remove_index = i;
+        size_t remove_count = 1;
+        if (i > 0 && ccb_instruction_is_pure(body->items[i - 1]))
+        {
+            remove_index = i - 1;
+            remove_count = 2;
+        }
+        string_list_remove_range(body, remove_index, remove_count);
+        if (remove_index > 0)
+            --i;
+    }
+}
+
+static void ccb_opt_simplify_const_branches(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i + 1 < body->count)
+    {
+        CcbConstInfo cond;
+        if (!ccb_parse_const_info(body->items[i], &cond) || strcmp(cond.type, "i1") != 0)
+        {
+            ++i;
+            continue;
+        }
+
+        char true_label[64] = {0};
+        char false_label[64] = {0};
+        if (!ccb_parse_branch_targets(body->items[i + 1], true_label, sizeof(true_label),
+                                      false_label, sizeof(false_label)))
+        {
+            ++i;
+            continue;
+        }
+
+        const char *dest = cond.u ? true_label : false_label;
+        if (!ccb_replace_linef(body, i + 1, "  jump %s", dest))
+        {
+            ++i;
+            continue;
+        }
+
+        string_list_remove_range(body, i, 1);
+        if (i > 0)
+            --i;
+    }
+}
+
+static void ccb_opt_remove_dead_local_copies(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i + 1 < body->count)
+    {
+        int src_idx = -1;
+        int dst_idx = -1;
+        if (!ccb_parse_local_index(body->items[i], "load_local", &src_idx) ||
+            !ccb_parse_local_index(body->items[i + 1], "store_local", &dst_idx) ||
+            src_idx == dst_idx)
+        {
+            ++i;
+            continue;
+        }
+
+        bool may_escape_block = false;
+        bool used = false;
+        bool killed = false;
+
+        for (size_t j = i + 2; j < body->count; ++j)
+        {
+            const char *line = body->items[j];
+            if (ccb_instruction_is_control_barrier(line))
+            {
+                const char *trimmed = ccb_trim_leading_ws(line);
+                if (!trimmed || strncmp(trimmed, "ret", 3) != 0)
+                    may_escape_block = true;
+                break;
+            }
+
+            int idx = -1;
+            if (ccb_parse_local_index(line, "load_local", &idx) && idx == dst_idx)
+            {
+                used = true;
+                break;
+            }
+            if ((ccb_parse_local_index(line, "store_local", &idx) ||
+                 ccb_parse_local_index(line, "addr_local", &idx)) &&
+                idx == dst_idx)
+            {
+                killed = true;
+                break;
+            }
+        }
+
+        if (used || may_escape_block)
+        {
+            ++i;
+            continue;
+        }
+
+        (void)killed;
+        string_list_remove_range(body, i, 2);
+        if (i > 0)
+            --i;
+    }
+}
+
+static void ccb_opt_simplify_addr_local_temp(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i + 2 < body->count)
+    {
+        int base_idx = -1;
+        int temp_idx = -1;
+        int load_idx = -1;
+        if (!ccb_parse_local_index(body->items[i], "addr_local", &base_idx) ||
+            !ccb_parse_local_index(body->items[i + 1], "store_local", &temp_idx) ||
+            !ccb_parse_local_index(body->items[i + 2], "load_local", &load_idx) ||
+            temp_idx != load_idx)
+        {
+            ++i;
+            continue;
+        }
+
+        bool used_later = false;
+        for (size_t j = i + 3; j < body->count; ++j)
+        {
+            const char *line = body->items[j];
+            if (ccb_instruction_is_control_barrier(line))
+                break;
+
+            int idx = -1;
+            if (ccb_parse_local_index(line, "load_local", &idx) && idx == temp_idx)
+            {
+                used_later = true;
+                break;
+            }
+            if ((ccb_parse_local_index(line, "store_local", &idx) ||
+                 ccb_parse_local_index(line, "addr_local", &idx)) &&
+                idx == temp_idx)
+                break;
+        }
+
+        if (used_later)
+        {
+            ++i;
+            continue;
+        }
+
+        (void)base_idx;
+        string_list_remove_range(body, i + 1, 2);
+        if (i > 0)
+            --i;
+    }
+}
+
+static void ccb_opt_remove_redundant_jumps(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i + 1 < body->count)
+    {
+        char jump_label[64] = {0};
+        char next_label[64] = {0};
+        if (!ccb_parse_jump_target(body->items[i], jump_label, sizeof(jump_label)) ||
+            !ccb_parse_label_name(body->items[i + 1], next_label, sizeof(next_label)) ||
+            strcmp(jump_label, next_label) != 0)
+        {
+            ++i;
+            continue;
+        }
+
+        string_list_remove_range(body, i, 1);
+        if (i > 0)
+            --i;
+    }
+}
+
+static void ccb_opt_remove_unused_labels(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    if (body->count == 0)
+        return;
+
+    StringList referenced;
+    string_list_init(&referenced);
+
+    for (size_t i = 0; i < body->count; ++i)
+    {
+        char jump_label[64] = {0};
+        if (ccb_parse_jump_target(body->items[i], jump_label, sizeof(jump_label)))
+        {
+            if (!string_list_contains(&referenced, jump_label))
+                string_list_append(&referenced, jump_label);
+            continue;
+        }
+
+        char true_label[64] = {0};
+        char false_label[64] = {0};
+        if (!ccb_parse_branch_targets(body->items[i], true_label, sizeof(true_label),
+                                      false_label, sizeof(false_label)))
+            continue;
+
+        if (!string_list_contains(&referenced, true_label))
+            string_list_append(&referenced, true_label);
+        if (!string_list_contains(&referenced, false_label))
+            string_list_append(&referenced, false_label);
+    }
+
+    for (size_t i = 0; i < body->count;)
+    {
+        char label[64] = {0};
+        if (!ccb_parse_label_name(body->items[i], label, sizeof(label)) ||
+            string_list_contains(&referenced, label))
+        {
+            ++i;
+            continue;
+        }
+
+        bool unreachable_from_fallthrough = (i > 0) && ccb_instruction_is_terminator(body->items[i - 1]);
+        if (!unreachable_from_fallthrough)
+        {
+            string_list_remove_range(body, i, 1);
+            continue;
+        }
+
+        size_t end = i + 1;
+        while (end < body->count)
+        {
+            char next_label[64] = {0};
+            if (ccb_parse_label_name(body->items[end], next_label, sizeof(next_label)))
+                break;
+            ++end;
+        }
+        string_list_remove_range(body, i, end - i);
+    }
+
+    string_list_free(&referenced);
+}
+
 static void ccb_function_optimize(CcbFunctionBuilder *fb, const CodegenOptions *opts)
 {
     if (!fb || !opts || opts->opt_level <= 0)
@@ -2732,6 +3213,12 @@ static void ccb_function_optimize(CcbFunctionBuilder *fb, const CodegenOptions *
         ccb_opt_fold_const_compares(fb);
 
         if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass fold test_null constants");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass fold test_null constants");
+        ccb_opt_fold_const_test_null(fb);
+
+        if (compiler_verbose_deep_enabled())
             compiler_verbose_treef("optimizer", "+-", "pass fold constant converts");
         if (compiler_verbose_enabled())
             compiler_verbose_logf("optimizer", "pass fold constant converts");
@@ -2745,6 +3232,76 @@ static void ccb_function_optimize(CcbFunctionBuilder *fb, const CodegenOptions *
         if (compiler_verbose_enabled())
             compiler_verbose_logf("optimizer", "pass simplify store/load/store");
         ccb_opt_simplify_store_load_store(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass propagate local values");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass propagate local values");
+        ccb_opt_propagate_local_values(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass remove dead local stores");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass remove dead local stores");
+        ccb_opt_remove_dead_local_stores(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass fold constant compares");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass fold constant compares");
+        ccb_opt_fold_const_compares(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass fold test_null constants");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass fold test_null constants");
+        ccb_opt_fold_const_test_null(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass simplify const branches");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass simplify const branches");
+        ccb_opt_simplify_const_branches(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass remove redundant jumps");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass remove redundant jumps");
+        ccb_opt_remove_redundant_jumps(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass remove unused labels");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass remove unused labels");
+        ccb_opt_remove_unused_labels(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass remove redundant jumps");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass remove redundant jumps");
+        ccb_opt_remove_redundant_jumps(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass remove unused labels");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass remove unused labels");
+        ccb_opt_remove_unused_labels(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass propagate local values");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass propagate local values");
+        ccb_opt_propagate_local_values(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass remove dead local stores");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass remove dead local stores");
+        ccb_opt_remove_dead_local_stores(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass remove dead local copies");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass remove dead local copies");
+        ccb_opt_remove_dead_local_copies(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass simplify addr_local temps");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass simplify addr_local temps");
+        ccb_opt_simplify_addr_local_temp(fb);
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass prune dropped values");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass prune dropped values");
+        ccb_opt_prune_dropped_values(fb);
         if (compiler_verbose_deep_enabled())
             compiler_verbose_treef("optimizer", "+-", "pass inline const_str locals");
         if (compiler_verbose_enabled())
@@ -3864,6 +4421,11 @@ static int ccb_emit_deref_address(CcbFunctionBuilder *fb, const Node *expr, CCVa
     {
         base_ty = CC_TYPE_PTR;
     }
+    else if (base_type && base_type->kind == TY_REF)
+    {
+        // treat refs like pointers for codegen; may need runtime null-check
+        base_ty = CC_TYPE_PTR;
+    }
     else if (base_ty != CC_TYPE_PTR)
     {
         diag_error_at(base->src, base->line, base->col,
@@ -3874,7 +4436,11 @@ static int ccb_emit_deref_address(CcbFunctionBuilder *fb, const Node *expr, CCVa
     if (ccb_emit_convert_between(fb, base_ty, CC_TYPE_PTR, base))
         return 1;
 
-    const Type *elem_type = (base_type && base_type->kind == TY_PTR) ? base_type->pointee : NULL;
+    const Type *elem_type = NULL;
+    if (base_type && base_type->kind == TY_PTR)
+        elem_type = base_type->pointee;
+    else if (base_type && base_type->kind == TY_REF)
+        elem_type = base_type->pointee;
     CCValueType elem_cc_ty = map_type_to_cc(elem_type);
     if (elem_type && elem_type->kind == TY_STRUCT)
     {
@@ -3889,6 +4455,101 @@ static int ccb_emit_deref_address(CcbFunctionBuilder *fb, const Node *expr, CCVa
         *out_elem_ty = elem_cc_ty;
     if (out_elem_type)
         *out_elem_type = elem_type;
+    // If base is a checked nullable ref, insert runtime null-check before any subsequent load.
+    if (base_type && base_type->kind == TY_REF && base_type->ref_nullability == 1)
+    {
+        // Keep pointer on stack for continuation and test a duplicate for null.
+        if (!string_list_appendf(&fb->body, "  dup ptr"))
+            return 1;
+        if (!string_list_appendf(&fb->body, "  test_null"))
+            return 1;
+
+        // create labels
+        char call_label[64];
+        char cont_label[64];
+        snprintf(call_label, sizeof(call_label), "Lcc_nullchk_call_%d", fb->next_label_id++);
+        snprintf(cont_label, sizeof(cont_label), "Lcc_nullchk_cont_%d", fb->next_label_id++);
+
+        if (!string_list_appendf(&fb->body, "  branch %s %s", call_label, cont_label))
+            return 1;
+
+        // call path
+        if (!string_list_appendf(&fb->body, "label %s", call_label))
+            return 1;
+
+        // ensure extern exists
+        if (!ccb_module_has_function(fb->module, "__cert__null_deref") && !ccb_module_has_extern(fb->module, "__cert__null_deref"))
+        {
+            if (!ccb_module_appendf(fb->module, ".extern __cert__null_deref params=(ptr,u64,ptr) returns=void"))
+                return 1;
+        }
+
+        // file literal global
+        const char *fname = expr->src && expr->src->filename ? expr->src->filename : "";
+        char *file_sym = ccb_make_string_symbol("file", (int)fb->local_count);
+        if (!file_sym)
+            return 1;
+        size_t flen = strlen(fname);
+        uint8_t *fbytes = (uint8_t *)malloc(flen + 1);
+        if (!fbytes)
+            return 1;
+        memcpy(fbytes, fname, flen);
+        fbytes[flen] = 0;
+        char *file_literal = ccb_encode_bytes_literal(fbytes, flen + 1);
+        free(fbytes);
+        if (!file_literal)
+            return 1;
+        if (!ccb_module_appendf(fb->module, ".global %s type=%s size=%zu align=1 data=%s const hidden", file_sym, cc_type_name(CC_TYPE_U8), flen + 1, file_literal))
+        {
+            free(file_literal);
+            free(file_sym);
+            return 1;
+        }
+        free(file_literal);
+
+        // name literal (var name if available)
+        const char *vname = "";
+        if (base->kind == ND_VAR && base->var_ref)
+            vname = base->var_ref;
+        char *name_sym = ccb_make_string_symbol("name", (int)fb->local_count + 1);
+        if (!name_sym)
+            return 1;
+        size_t nlen = strlen(vname);
+        uint8_t *nbytes = (uint8_t *)malloc(nlen + 1);
+        if (!nbytes)
+            return 1;
+        memcpy(nbytes, vname, nlen);
+        nbytes[nlen] = 0;
+        char *name_literal = ccb_encode_bytes_literal(nbytes, nlen + 1);
+        free(nbytes);
+        if (!name_literal)
+            return 1;
+        if (!ccb_module_appendf(fb->module, ".global %s type=%s size=%zu align=1 data=%s const hidden", name_sym, cc_type_name(CC_TYPE_U8), nlen + 1, name_literal))
+        {
+            free(name_literal);
+            free(name_sym);
+            return 1;
+        }
+        free(name_literal);
+
+        // push file ptr, line u64, name ptr then call
+        if (!ccb_emit_addr_global(&fb->body, file_sym))
+            return 1;
+        if (!ccb_emit_const_u64(&fb->body, CC_TYPE_U64, (uint64_t)expr->line))
+            return 1;
+        if (!ccb_emit_addr_global(&fb->body, name_sym))
+            return 1;
+        if (!string_list_appendf(&fb->body, "  call __cert__null_deref void (ptr,u64,ptr)"))
+            return 1;
+
+        // continuation label
+        if (!string_list_appendf(&fb->body, "label %s", cont_label))
+            return 1;
+
+        // free symbol names allocated
+        free(file_sym);
+        free(name_sym);
+    }
     return 0;
 }
 
@@ -5994,10 +6655,87 @@ static int ccb_emit_expr_basic_impl(CcbFunctionBuilder *fb, const Node *expr)
     case ND_PREDEC:
     {
         const Node *target = expr->lhs;
-        if (!target || target->kind != ND_VAR || !target->var_ref)
+        if (!target)
         {
             diag_error_at(expr->src, expr->line, expr->col,
-                          "operand of %s must be a variable",
+                          "operand of %s must be an lvalue",
+                          expr->kind == ND_PREINC ? "++" : "--");
+            return 1;
+        }
+
+        if (target->kind == ND_DEREF)
+        {
+            CCValueType elem_ty = CC_TYPE_I32;
+            const Type *elem_type = NULL;
+            if (ccb_emit_deref_address(fb, target, &elem_ty, &elem_type))
+                return 1;
+
+            Type *value_type = (Type *)(elem_type ? elem_type : target->type);
+            Type *addr_type = type_ptr(value_type);
+            CcbLocal *addr_local = ccb_local_add(fb, NULL, addr_type, false, false);
+            if (!addr_local)
+                return 1;
+            if (!ccb_emit_store_local(fb, addr_local))
+                return 1;
+
+            bool is_ptr = (elem_ty == CC_TYPE_PTR);
+            if (!ccb_value_type_is_integer(elem_ty) && !is_ptr)
+            {
+                diag_error_at(expr->src, expr->line, expr->col,
+                              "%s only supported on integer or pointer lvalues",
+                              expr->kind == ND_PREINC ? "pre-increment" : "pre-decrement");
+                return 1;
+            }
+
+            size_t elem_size = is_ptr ? ccb_pointer_elem_size(value_type) : 1;
+            const char *op = expr->kind == ND_PREINC ? "add" : "sub";
+
+            if (!ccb_emit_load_local(fb, addr_local))
+                return 1;
+            if (!ccb_emit_load_indirect(&fb->body, elem_ty))
+                return 1;
+
+            if (is_ptr)
+            {
+                if (ccb_emit_convert_between(fb, elem_ty, CC_TYPE_I64, expr))
+                    return 1;
+                if (!ccb_emit_const(&fb->body, CC_TYPE_I64, (int64_t)elem_size))
+                    return 1;
+                if (!string_list_appendf(&fb->body, "  binop %s i64", op))
+                    return 1;
+                if (ccb_emit_convert_between(fb, CC_TYPE_I64, CC_TYPE_PTR, expr))
+                    return 1;
+            }
+            else
+            {
+                if (!ccb_emit_const(&fb->body, elem_ty, 1))
+                    return 1;
+                if (!string_list_appendf(&fb->body, "  binop %s %s", op, cc_type_name(elem_ty)))
+                    return 1;
+            }
+
+            CcbLocal *new_value = ccb_local_add(fb, NULL, value_type, false, false);
+            if (!new_value)
+                return 1;
+            if (!ccb_emit_store_local(fb, new_value))
+                return 1;
+
+            if (!ccb_emit_load_local(fb, addr_local))
+                return 1;
+            if (!ccb_emit_load_local(fb, new_value))
+                return 1;
+            if (!ccb_emit_store_indirect(&fb->body, elem_ty))
+                return 1;
+
+            if (!ccb_emit_load_local(fb, new_value))
+                return 1;
+            return 0;
+        }
+
+        if (target->kind != ND_VAR || !target->var_ref)
+        {
+            diag_error_at(expr->src, expr->line, expr->col,
+                          "operand of %s must be a variable or dereference",
                           expr->kind == ND_PREINC ? "++" : "--");
             return 1;
         }
@@ -6070,10 +6808,95 @@ static int ccb_emit_expr_basic_impl(CcbFunctionBuilder *fb, const Node *expr)
     case ND_POSTDEC:
     {
         const Node *target = expr->lhs;
-        if (!target || target->kind != ND_VAR || !target->var_ref)
+        if (!target)
         {
             diag_error_at(expr->src, expr->line, expr->col,
-                          "operand of %s must be a variable",
+                          "operand of %s must be an lvalue",
+                          expr->kind == ND_POSTINC ? "post-increment" : "post-decrement");
+            return 1;
+        }
+
+        if (target->kind == ND_DEREF)
+        {
+            CCValueType elem_ty = CC_TYPE_I32;
+            const Type *elem_type = NULL;
+            if (ccb_emit_deref_address(fb, target, &elem_ty, &elem_type))
+                return 1;
+
+            Type *value_type = (Type *)(elem_type ? elem_type : target->type);
+            Type *addr_type = type_ptr(value_type);
+            CcbLocal *addr_local = ccb_local_add(fb, NULL, addr_type, false, false);
+            if (!addr_local)
+                return 1;
+            if (!ccb_emit_store_local(fb, addr_local))
+                return 1;
+
+            bool is_ptr = (elem_ty == CC_TYPE_PTR);
+            if (!ccb_value_type_is_integer(elem_ty) && !is_ptr)
+            {
+                diag_error_at(expr->src, expr->line, expr->col,
+                              "%s only supported on integer or pointer lvalues",
+                              expr->kind == ND_POSTINC ? "post-increment" : "post-decrement");
+                return 1;
+            }
+
+            size_t elem_size = is_ptr ? ccb_pointer_elem_size(value_type) : 1;
+            const char *op = expr->kind == ND_POSTINC ? "add" : "sub";
+
+            if (!ccb_emit_load_local(fb, addr_local))
+                return 1;
+            if (!ccb_emit_load_indirect(&fb->body, elem_ty))
+                return 1;
+
+            CcbLocal *old_value = ccb_local_add(fb, NULL, value_type, false, false);
+            if (!old_value)
+                return 1;
+            if (!ccb_emit_store_local(fb, old_value))
+                return 1;
+
+            if (!ccb_emit_load_local(fb, old_value))
+                return 1;
+            if (is_ptr)
+            {
+                if (ccb_emit_convert_between(fb, elem_ty, CC_TYPE_I64, expr))
+                    return 1;
+                if (!ccb_emit_const(&fb->body, CC_TYPE_I64, (int64_t)elem_size))
+                    return 1;
+                if (!string_list_appendf(&fb->body, "  binop %s i64", op))
+                    return 1;
+                if (ccb_emit_convert_between(fb, CC_TYPE_I64, CC_TYPE_PTR, expr))
+                    return 1;
+            }
+            else
+            {
+                if (!ccb_emit_const(&fb->body, elem_ty, 1))
+                    return 1;
+                if (!string_list_appendf(&fb->body, "  binop %s %s", op, cc_type_name(elem_ty)))
+                    return 1;
+            }
+
+            CcbLocal *new_value = ccb_local_add(fb, NULL, value_type, false, false);
+            if (!new_value)
+                return 1;
+            if (!ccb_emit_store_local(fb, new_value))
+                return 1;
+
+            if (!ccb_emit_load_local(fb, addr_local))
+                return 1;
+            if (!ccb_emit_load_local(fb, new_value))
+                return 1;
+            if (!ccb_emit_store_indirect(&fb->body, elem_ty))
+                return 1;
+
+            if (!ccb_emit_load_local(fb, old_value))
+                return 1;
+            return 0;
+        }
+
+        if (target->kind != ND_VAR || !target->var_ref)
+        {
+            diag_error_at(expr->src, expr->line, expr->col,
+                          "operand of %s must be a variable or dereference",
                           expr->kind == ND_POSTINC ? "post-increment" : "post-decrement");
             return 1;
         }

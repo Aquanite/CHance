@@ -1,0 +1,14 @@
+extend from "C" int printf(constant char* format, ...);
+extend fun __cert__runtime_error_ex(i32 code, char* category, char* message, char* file, u64 line, char* symbol) -> void;
+
+[Export]
+expose fun __cert__null_deref(char* file, u64 line, char* name_of_ref_obj) -> void {
+    __cert__runtime_error_ex(
+        0xDEADC0DE,
+        "NullReference",
+        "Attempted to dereference null reference",
+        file,
+        line,
+        name_of_ref_obj
+    );
+}

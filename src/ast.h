@@ -50,6 +50,7 @@ typedef enum
     TK_KW_VOID,
     TK_KW_CHAR,
     TK_KW_BOOL,
+    TK_KW_REF,
     TK_KW_VAR,
     TK_KW_IF,
     TK_KW_ELSE,
@@ -159,6 +160,7 @@ typedef enum
     TY_BOOL,
     TY_FUNC,
     TY_PTR,
+    TY_REF,
     TY_STRUCT,
     TY_ARRAY,
     TY_VA_LIST,
@@ -179,6 +181,9 @@ typedef struct Type
 {
     TypeKind kind;
     struct Type *pointee; // for TY_PTR
+    // For TY_REF: nullability semantics
+    // 0 = non-nullable, 1 = nullable (checked), 2 = nullable (unchecked)
+    int ref_nullability;
     // For TY_STRUCT
     const char *struct_name;
     struct
@@ -515,6 +520,7 @@ Type *type_template_param(const char *name, int index);
 Type *type_ptr(Type *to);
 Type *type_array(Type *elem, int length);
 Type *type_func(void);
+Type *type_ref(Type *to, int nullability);
 int type_equals(Type *a, Type *b);
 
 // Codegen options when emitting ChanceCode bytecode (.ccb)

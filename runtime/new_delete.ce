@@ -4,7 +4,7 @@
 extend from "C" int printf(constant char* format, ...);
 #endif
 
-extend fun __cert__panic(char* message) -> void;
+extend fun __cert__runtime_error(char* category, char* message) -> void;
 extend fun __cert__malloc(u64 size) -> void*;
 extend fun __cert__free(void* ptr) -> void*;
 
@@ -18,7 +18,7 @@ expose fun __cert__new(u64 size) -> void* {
     #endif
     void* ptr = __cert__malloc(size);
     if (ptr == null) {
-        __cert__panic("Out of memory");
+        __cert__runtime_error("OutOfMemory", "allocation failed in __cert__new");
     }
 
     // track ptr for GC
