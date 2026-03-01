@@ -455,6 +455,7 @@ static CCValueType ccb_type_for_expr(const Node *expr);
 static size_t ccb_type_size_bytes(const Type *ty);
 static bool ccb_module_append_extern(CcbModule *mod, const Symbol *sym);
 static int ccb_module_emit_externs(CcbModule *mod, const CodegenOptions *opts);
+static void ccb_module_optimize(CcbModule *mod, const CodegenOptions *opts);
 static void ccb_function_optimize(CcbFunctionBuilder *fb, const CodegenOptions *opts);
 static bool ccb_instruction_is_pure(const char *line);
 static void ccb_opt_prune_dropped_values(CcbFunctionBuilder *fb);
@@ -463,6 +464,11 @@ static void ccb_opt_fold_const_unops(CcbFunctionBuilder *fb);
 static void ccb_opt_fold_const_compares(CcbFunctionBuilder *fb);
 static void ccb_opt_fold_const_test_null(CcbFunctionBuilder *fb);
 static void ccb_opt_fold_const_converts(CcbFunctionBuilder *fb);
+static void ccb_opt_simplify_noop_arith_and_bitcasts(CcbFunctionBuilder *fb);
+static void ccb_opt_fold_const_or_store_chains(CcbFunctionBuilder *fb);
+static void ccb_opt_fold_dup_rmw_or_chains(CcbFunctionBuilder *fb);
+static void ccb_opt_pack_byte_store_runs(CcbFunctionBuilder *fb);
+static void ccb_opt_remove_overwritten_indirect_stores(CcbFunctionBuilder *fb);
 static void ccb_opt_simplify_store_load_store(CcbFunctionBuilder *fb);
 static void ccb_opt_propagate_local_values(CcbFunctionBuilder *fb);
 static void ccb_opt_remove_dead_local_stores(CcbFunctionBuilder *fb);
@@ -760,6 +766,130 @@ static int ccb_module_emit_imported_globals(CcbModule *mod, const CodegenOptions
             return 1;
     }
     return 0;
+}
+
+static bool ccb_parse_symbol_after_prefix(const char *line, const char *prefix,
+                                          char *out, size_t outsz)
+{
+    if (!line || !prefix || !out || outsz == 0)
+        return false;
+    out[0] = '\0';
+
+    const char *cursor = line;
+    while (*cursor == ' ' || *cursor == '\t')
+        ++cursor;
+
+    size_t prelen = strlen(prefix);
+    if (strncmp(cursor, prefix, prelen) != 0)
+        return false;
+
+    cursor += prelen;
+    while (*cursor == ' ' || *cursor == '\t')
+        ++cursor;
+    if (*cursor == '\0')
+        return false;
+
+    size_t n = 0;
+    while (*cursor && *cursor != ' ' && *cursor != '\t' && *cursor != '\r' && *cursor != '\n')
+    {
+        if (n + 1 >= outsz)
+            return false;
+        out[n++] = *cursor++;
+    }
+
+    if (n == 0)
+        return false;
+    out[n] = '\0';
+    return true;
+}
+
+static bool ccb_parse_symbol_reference(const char *line, char *out, size_t outsz)
+{
+    if (!line || !out || outsz == 0)
+        return false;
+    out[0] = '\0';
+
+    if (ccb_parse_symbol_after_prefix(line, "call ", out, outsz))
+    {
+        if (strcmp(out, "call_indirect") != 0)
+            return true;
+        out[0] = '\0';
+    }
+
+    return ccb_parse_symbol_after_prefix(line, "addr_global ", out, outsz) ||
+           ccb_parse_symbol_after_prefix(line, "load_global ", out, outsz) ||
+           ccb_parse_symbol_after_prefix(line, "store_global ", out, outsz);
+}
+
+static bool ccb_parse_extern_symbol(const char *line, char *out, size_t outsz)
+{
+    return ccb_parse_symbol_after_prefix(line, ".extern ", out, outsz);
+}
+
+static bool ccb_parse_no_return_symbol(const char *line, char *out, size_t outsz)
+{
+    return ccb_parse_symbol_after_prefix(line, ".no-return ", out, outsz);
+}
+
+static void ccb_module_optimize(CcbModule *mod, const CodegenOptions *opts)
+{
+    if (!mod || !opts || opts->opt_level < 2 || mod->lines.count == 0)
+        return;
+
+    StringList used_symbols;
+    string_list_init(&used_symbols);
+
+    for (size_t i = 0; i < mod->lines.count; ++i)
+    {
+        const char *line = mod->lines.items[i];
+        char symbol[256] = {0};
+        if (!ccb_parse_symbol_reference(line, symbol, sizeof(symbol)))
+            continue;
+        if (!string_list_contains(&used_symbols, symbol))
+            string_list_append(&used_symbols, symbol);
+    }
+
+    size_t removed_externs = 0;
+    size_t removed_no_return = 0;
+    for (size_t i = 0; i < mod->lines.count;)
+    {
+        const char *line = mod->lines.items[i];
+        char symbol[256] = {0};
+
+        if (ccb_parse_extern_symbol(line, symbol, sizeof(symbol)))
+        {
+            if (!string_list_contains(&used_symbols, symbol))
+            {
+                string_list_remove_range(&mod->lines, i, 1);
+                ++removed_externs;
+                continue;
+            }
+            ++i;
+            continue;
+        }
+
+        if (ccb_parse_no_return_symbol(line, symbol, sizeof(symbol)))
+        {
+            bool symbol_is_defined = string_list_contains(&mod->defined_funcs, symbol);
+            bool symbol_is_used = string_list_contains(&used_symbols, symbol);
+            if (!symbol_is_defined && !symbol_is_used)
+            {
+                string_list_remove_range(&mod->lines, i, 1);
+                ++removed_no_return;
+                continue;
+            }
+        }
+
+        ++i;
+    }
+
+    if (compiler_verbose_enabled() && (removed_externs || removed_no_return))
+    {
+        compiler_verbose_logf("optimizer", "module pass: pruned %zu externs, %zu no-return tags",
+                              removed_externs, removed_no_return);
+    }
+
+    string_list_free(&used_symbols);
 }
 
 static void ccb_function_builder_init(CcbFunctionBuilder *fb, CcbModule *mod, const Node *fn, bool enable_debug)
@@ -1760,6 +1890,463 @@ static bool ccb_parse_zero_store_at_offset(const StringList *body, size_t index,
     return true;
 }
 
+typedef struct
+{
+    const char *load_op;
+    int load_index;
+    int offset;
+    unsigned byte_value;
+    size_t start;
+    size_t end;
+    size_t value_line;
+    size_t store_line;
+} CcbByteStorePattern;
+
+typedef struct
+{
+    const char *load_op;
+    int load_index;
+    int offset;
+    int width_bytes;
+    size_t start;
+    size_t end;
+} CcbIndirectStorePattern;
+
+typedef struct
+{
+    size_t start;
+    size_t addr_start;
+    size_t addr_end;
+    size_t const_line;
+    size_t store_line;
+    size_t end;
+    CcbConstInfo value;
+} CcbConstStoreBlock;
+
+typedef struct
+{
+    size_t start;
+    size_t end;
+    unsigned long long or_value;
+} CcbOrStoreBlock;
+
+static bool ccb_is_loc_directive(const char *line)
+{
+    if (!line)
+        return false;
+    line = ccb_trim_leading_ws(line);
+    return strncmp(line, ".loc ", 5) == 0;
+}
+
+static size_t ccb_skip_loc_directives(const StringList *body, size_t index)
+{
+    if (!body)
+        return index;
+    while (index < body->count && ccb_is_loc_directive(body->items[index]))
+        ++index;
+    return index;
+}
+
+static bool ccb_is_byte_store_line(const char *line)
+{
+    if (!line)
+        return false;
+    line = ccb_trim_leading_ws(line);
+    return strcmp(line, "store_indirect i8") == 0 || strcmp(line, "store_indirect u8") == 0;
+}
+
+static bool ccb_parse_store_indirect_width(const char *line, int *out_width_bytes)
+{
+    if (!line || !out_width_bytes)
+        return false;
+    line = ccb_trim_leading_ws(line);
+    if (strncmp(line, "store_indirect ", 15) != 0)
+        return false;
+    line += 15;
+    while (*line == ' ' || *line == '\t')
+        ++line;
+    if (*line == '\0')
+        return false;
+    char type_name[16] = {0};
+    size_t pos = 0;
+    while (*line && !isspace((unsigned char)*line) && pos + 1 < sizeof(type_name))
+        type_name[pos++] = *line++;
+    type_name[pos] = '\0';
+    unsigned bits = ccb_type_bit_width_from_name(type_name);
+    if (bits == 0 || bits % 8 != 0)
+        return false;
+    *out_width_bytes = (int)(bits / 8);
+    return *out_width_bytes > 0;
+}
+
+static bool ccb_parse_indirect_store_pattern(const StringList *body, size_t start,
+                                             CcbIndirectStorePattern *out)
+{
+    if (!body || !out || start >= body->count)
+        return false;
+
+    memset(out, 0, sizeof(*out));
+    out->start = start;
+
+    size_t p = ccb_skip_loc_directives(body, start);
+    if (p >= body->count)
+        return false;
+    if (!ccb_parse_load_ref(body->items[p], &out->load_op, &out->load_index))
+        return false;
+
+    int offset = 0;
+    size_t p_next = ccb_skip_loc_directives(body, p + 1);
+    if (p_next >= body->count)
+        return false;
+
+    if (ccb_is_exact_line(body->items[p_next], "convert bitcast ptr i64"))
+    {
+        p_next = ccb_skip_loc_directives(body, p_next + 1);
+        long long offset_i64 = 0;
+        if (!ccb_parse_const_i64(body->items[p_next], &offset_i64))
+            return false;
+        if (offset_i64 < INT_MIN || offset_i64 > INT_MAX)
+            return false;
+        offset = (int)offset_i64;
+
+        p_next = ccb_skip_loc_directives(body, p_next + 1);
+        if (p_next >= body->count || !ccb_is_exact_line(body->items[p_next], "binop add i64"))
+            return false;
+
+        p_next = ccb_skip_loc_directives(body, p_next + 1);
+        if (p_next >= body->count || !ccb_is_exact_line(body->items[p_next], "convert bitcast i64 ptr"))
+            return false;
+
+        p_next = ccb_skip_loc_directives(body, p_next + 1);
+    }
+    else
+    {
+        offset = 0;
+    }
+
+    if (p_next >= body->count)
+        return false;
+    CcbConstInfo cinfo;
+    if (!ccb_parse_const_info(body->items[p_next], &cinfo))
+        return false;
+
+    p_next = ccb_skip_loc_directives(body, p_next + 1);
+    if (p_next >= body->count)
+        return false;
+    int width_bytes = 0;
+    if (!ccb_parse_store_indirect_width(body->items[p_next], &width_bytes))
+        return false;
+
+    out->offset = offset;
+    out->width_bytes = width_bytes;
+    out->end = p_next + 1;
+    return true;
+}
+
+static bool ccb_parse_byte_store_pattern(const StringList *body, size_t start, CcbByteStorePattern *out)
+{
+    if (!body || !out || start >= body->count)
+        return false;
+
+    memset(out, 0, sizeof(*out));
+    out->start = start;
+
+    size_t p = ccb_skip_loc_directives(body, start);
+    if (p >= body->count)
+        return false;
+    if (!ccb_parse_load_ref(body->items[p], &out->load_op, &out->load_index))
+        return false;
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    if (p >= body->count || !ccb_is_exact_line(body->items[p], "convert bitcast ptr i64"))
+        return false;
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    if (p >= body->count)
+        return false;
+
+    int offset_i32 = 0;
+    long long offset_i64 = 0;
+    if (ccb_parse_const_i32(body->items[p], &offset_i32))
+    {
+        out->offset = offset_i32;
+
+        p = ccb_skip_loc_directives(body, p + 1);
+        if (p >= body->count)
+            return false;
+        if (!ccb_is_exact_line(body->items[p], "convert sext i32 i64") &&
+            !ccb_is_exact_line(body->items[p], "convert zext i32 i64"))
+            return false;
+
+        p = ccb_skip_loc_directives(body, p + 1);
+        if (p >= body->count || !ccb_is_exact_line(body->items[p], "binop add i64"))
+            return false;
+
+        p = ccb_skip_loc_directives(body, p + 1);
+        if (p >= body->count || !ccb_is_exact_line(body->items[p], "convert bitcast i64 ptr"))
+            return false;
+    }
+    else
+    {
+        if (!ccb_parse_const_i64(body->items[p], &offset_i64))
+            return false;
+        if (offset_i64 < INT_MIN || offset_i64 > INT_MAX)
+            return false;
+        out->offset = (int)offset_i64;
+
+        p = ccb_skip_loc_directives(body, p + 1);
+        if (p >= body->count || !ccb_is_exact_line(body->items[p], "binop add i64"))
+            return false;
+
+        p = ccb_skip_loc_directives(body, p + 1);
+        if (p >= body->count || !ccb_is_exact_line(body->items[p], "convert bitcast i64 ptr"))
+            return false;
+    }
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    if (p >= body->count)
+        return false;
+
+    CcbConstInfo cinfo;
+    if (!ccb_parse_const_info(body->items[p], &cinfo))
+        return false;
+    if (!(strcmp(cinfo.type, "i8") == 0 || strcmp(cinfo.type, "u8") == 0))
+        return false;
+    out->byte_value = (unsigned)(cinfo.u & 0xFFULL);
+    out->value_line = p;
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    if (p >= body->count || !ccb_is_byte_store_line(body->items[p]))
+        return false;
+    out->store_line = p;
+    out->end = p + 1;
+    return true;
+}
+
+static bool ccb_trimmed_lines_equal(const char *lhs, const char *rhs)
+{
+    lhs = ccb_trim_leading_ws(lhs);
+    rhs = ccb_trim_leading_ws(rhs);
+    if (!lhs || !rhs)
+        return false;
+    return strcmp(lhs, rhs) == 0;
+}
+
+static bool ccb_match_addr_sequence(const StringList *body, size_t start,
+                                    size_t addr_ref_start, size_t addr_ref_end,
+                                    size_t *out_next)
+{
+    if (!body || !out_next || addr_ref_end <= addr_ref_start)
+        return false;
+
+    size_t cursor = ccb_skip_loc_directives(body, start);
+    size_t ref = ccb_skip_loc_directives(body, addr_ref_start);
+    while (ref < addr_ref_end)
+    {
+        if (cursor >= body->count)
+            return false;
+        if (!ccb_trimmed_lines_equal(body->items[cursor], body->items[ref]))
+            return false;
+        cursor = ccb_skip_loc_directives(body, cursor + 1);
+        ref = ccb_skip_loc_directives(body, ref + 1);
+    }
+
+    *out_next = cursor;
+    return true;
+}
+
+static bool ccb_parse_const_store_block(const StringList *body, size_t start,
+                                        CcbConstStoreBlock *out)
+{
+    if (!body || !out || start >= body->count)
+        return false;
+
+    memset(out, 0, sizeof(*out));
+    out->start = start;
+
+    size_t p = ccb_skip_loc_directives(body, start);
+    if (p >= body->count)
+        return false;
+
+    const size_t addr_start = p;
+    size_t addr_steps = 0;
+    while (p < body->count)
+    {
+        CcbConstInfo cinfo;
+        if (ccb_parse_const_info(body->items[p], &cinfo))
+        {
+            size_t store_line = ccb_skip_loc_directives(body, p + 1);
+            if (store_line >= body->count)
+                return false;
+            char expected_store[64] = {0};
+            snprintf(expected_store, sizeof(expected_store), "store_indirect %s", cinfo.type);
+            if (!ccb_is_exact_line(body->items[store_line], expected_store))
+                return false;
+            if (addr_steps == 0)
+                return false;
+
+            size_t prev = p;
+            bool found_prev = false;
+            while (prev > 0)
+            {
+                --prev;
+                if (ccb_is_loc_directive(body->items[prev]))
+                    continue;
+                found_prev = true;
+                break;
+            }
+            if (!found_prev || !ccb_is_exact_line(body->items[prev], "convert bitcast i64 ptr"))
+                return false;
+
+            out->addr_start = addr_start;
+            out->addr_end = p;
+            out->const_line = p;
+            out->store_line = store_line;
+            out->end = store_line + 1;
+            out->value = cinfo;
+            return true;
+        }
+
+        const char *line = ccb_trim_leading_ws(body->items[p]);
+        if (!line)
+            return false;
+
+        bool addr_step = strncmp(line, "addr_global ", 12) == 0 ||
+                         strncmp(line, "addr_local ", 11) == 0 ||
+                         strncmp(line, "addr_param ", 11) == 0;
+        if (!addr_step && !ccb_instruction_is_pure(line))
+            return false;
+
+        ++addr_steps;
+        if (addr_steps > 16)
+            return false;
+
+        ++p;
+        p = ccb_skip_loc_directives(body, p);
+    }
+
+    return false;
+}
+
+static bool ccb_parse_or_store_block(const StringList *body, size_t start,
+                                     size_t addr_ref_start, size_t addr_ref_end,
+                                     const char *type_name,
+                                     CcbOrStoreBlock *out)
+{
+    if (!body || !type_name || !out || start >= body->count || addr_ref_end <= addr_ref_start)
+        return false;
+
+    memset(out, 0, sizeof(*out));
+    out->start = start;
+
+    size_t p = 0;
+    if (!ccb_match_addr_sequence(body, start, addr_ref_start, addr_ref_end, &p))
+        return false;
+
+    char expected_line[64] = {0};
+    snprintf(expected_line, sizeof(expected_line), "load_indirect %s", type_name);
+
+    // Form A (direct stack):
+    //   [addr-expr]
+    //   [dup]
+    //   load_indirect T
+    //   const T C
+    //   binop or T
+    //   store_indirect T
+    size_t q = p;
+    if (q < body->count && ccb_is_prefix_line(body->items[q], "dup"))
+        q = ccb_skip_loc_directives(body, q + 1);
+    if (q < body->count && ccb_is_exact_line(body->items[q], expected_line))
+    {
+        q = ccb_skip_loc_directives(body, q + 1);
+
+        CcbConstInfo direct_const;
+        if (q < body->count && ccb_parse_const_info(body->items[q], &direct_const) &&
+            strcmp(direct_const.type, type_name) == 0)
+        {
+            q = ccb_skip_loc_directives(body, q + 1);
+
+            char op_name[16] = {0};
+            char op_type[16] = {0};
+            bool unsigned_hint = false;
+            if (q < body->count &&
+                ccb_parse_binop_info(body->items[q], op_name, sizeof(op_name), op_type, sizeof(op_type), &unsigned_hint) &&
+                strcmp(op_name, "or") == 0 && strcmp(op_type, type_name) == 0)
+            {
+                (void)unsigned_hint;
+                q = ccb_skip_loc_directives(body, q + 1);
+
+                snprintf(expected_line, sizeof(expected_line), "store_indirect %s", type_name);
+                if (q < body->count && ccb_is_exact_line(body->items[q], expected_line))
+                {
+                    out->or_value = direct_const.u;
+                    out->end = q + 1;
+                    return true;
+                }
+            }
+        }
+    }
+
+    int ptr_idx = -1;
+    int val_idx = -1;
+    if (p >= body->count || !ccb_parse_local_index(body->items[p], "store_local", &ptr_idx))
+        return false;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    int idx = -1;
+    if (p >= body->count || !ccb_parse_local_index(body->items[p], "load_local", &idx) || idx != ptr_idx)
+        return false;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    snprintf(expected_line, sizeof(expected_line), "load_indirect %s", type_name);
+    if (p >= body->count || !ccb_is_exact_line(body->items[p], expected_line))
+        return false;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    if (p >= body->count || !ccb_parse_local_index(body->items[p], "store_local", &val_idx))
+        return false;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    if (p >= body->count || !ccb_parse_local_index(body->items[p], "load_local", &idx) || idx != val_idx)
+        return false;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    CcbConstInfo cinfo;
+    if (p >= body->count || !ccb_parse_const_info(body->items[p], &cinfo) || strcmp(cinfo.type, type_name) != 0)
+        return false;
+    out->or_value = cinfo.u;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    char op_name[16] = {0};
+    char op_type[16] = {0};
+    bool unsigned_hint = false;
+    if (p >= body->count ||
+        !ccb_parse_binop_info(body->items[p], op_name, sizeof(op_name), op_type, sizeof(op_type), &unsigned_hint) ||
+        strcmp(op_name, "or") != 0 || strcmp(op_type, type_name) != 0)
+        return false;
+    (void)unsigned_hint;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    if (p >= body->count || !ccb_parse_local_index(body->items[p], "store_local", &idx) || idx != val_idx)
+        return false;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    if (p >= body->count || !ccb_parse_local_index(body->items[p], "load_local", &idx) || idx != ptr_idx)
+        return false;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    if (p >= body->count || !ccb_parse_local_index(body->items[p], "load_local", &idx) || idx != val_idx)
+        return false;
+    p = ccb_skip_loc_directives(body, p + 1);
+
+    snprintf(expected_line, sizeof(expected_line), "store_indirect %s", type_name);
+    if (p >= body->count || !ccb_is_exact_line(body->items[p], expected_line))
+        return false;
+
+    out->end = p + 1;
+    return true;
+}
+
 static bool ccb_replace_linef(StringList *body, size_t index, const char *fmt, ...)
 {
     if (!body || !fmt || index >= body->count)
@@ -2337,6 +2924,484 @@ static void ccb_opt_fold_const_converts(CcbFunctionBuilder *fb)
         string_list_remove_range(body, i + 1, 1);
         if (i > 0)
             --i;
+    }
+}
+
+static void ccb_opt_simplify_noop_arith_and_bitcasts(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i + 2 < body->count)
+    {
+        CcbConstInfo rhs_const;
+        char op_name[16];
+        char type_name[16];
+        bool unsigned_hint = false;
+        if (ccb_parse_const_info(body->items[i + 1], &rhs_const) &&
+            ccb_parse_binop_info(body->items[i + 2], op_name, sizeof(op_name),
+                                 type_name, sizeof(type_name), &unsigned_hint) &&
+            strcmp(rhs_const.type, type_name) == 0 &&
+            rhs_const.u == 0ULL &&
+            (ccb_type_is_integer_name(type_name) || ccb_type_is_ptr_name(type_name)) &&
+            (strcmp(op_name, "add") == 0 || strcmp(op_name, "sub") == 0 ||
+             strcmp(op_name, "or") == 0 || strcmp(op_name, "xor") == 0))
+        {
+            (void)unsigned_hint;
+            string_list_remove_range(body, i + 1, 2);
+            if (i > 0)
+                --i;
+            continue;
+        }
+
+        CcbConstInfo lhs_const;
+        if (ccb_parse_const_info(body->items[i], &lhs_const) &&
+            ccb_parse_binop_info(body->items[i + 2], op_name, sizeof(op_name),
+                                 type_name, sizeof(type_name), &unsigned_hint) &&
+            strcmp(lhs_const.type, type_name) == 0 &&
+            lhs_const.u == 0ULL &&
+            (ccb_type_is_integer_name(type_name) || ccb_type_is_ptr_name(type_name)) &&
+            (strcmp(op_name, "add") == 0 || strcmp(op_name, "or") == 0 ||
+             strcmp(op_name, "xor") == 0))
+        {
+            (void)unsigned_hint;
+            string_list_remove_range(body, i + 2, 1);
+            string_list_remove_range(body, i, 1);
+            if (i > 0)
+                --i;
+            continue;
+        }
+
+        ++i;
+    }
+
+    i = 0;
+    while (i + 1 < body->count)
+    {
+        char kind1[16], from1[16], to1[16];
+        char kind2[16], from2[16], to2[16];
+        if (!ccb_parse_convert_info(body->items[i], kind1, sizeof(kind1), from1, sizeof(from1), to1, sizeof(to1)) ||
+            !ccb_parse_convert_info(body->items[i + 1], kind2, sizeof(kind2), from2, sizeof(from2), to2, sizeof(to2)))
+        {
+            ++i;
+            continue;
+        }
+
+        if (strcmp(kind1, "bitcast") == 0 && strcmp(kind2, "bitcast") == 0 &&
+            strcmp(from1, to2) == 0 && strcmp(to1, from2) == 0)
+        {
+            string_list_remove_range(body, i, 2);
+            if (i > 0)
+                --i;
+            continue;
+        }
+
+        ++i;
+    }
+}
+
+static void ccb_opt_fold_const_or_store_chains(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i < body->count)
+    {
+        CcbConstStoreBlock base;
+        if (!ccb_parse_const_store_block(body, i, &base))
+        {
+            ++i;
+            continue;
+        }
+
+        unsigned long long combined = base.value.u;
+        size_t cursor = base.end;
+        size_t folded_blocks = 0;
+
+        while (cursor < body->count)
+        {
+            CcbOrStoreBlock rmw;
+            if (!ccb_parse_or_store_block(body, cursor,
+                                          base.addr_start, base.addr_end,
+                                          base.value.type, &rmw))
+                break;
+
+            combined |= rmw.or_value;
+            cursor = rmw.end;
+            ++folded_blocks;
+        }
+
+        if (folded_blocks == 0)
+        {
+            i = base.end;
+            continue;
+        }
+
+        unsigned long long masked = combined & ccb_mask_for_width(base.value.width);
+        long long signed_value = ccb_type_is_signed_name(base.value.type)
+                                     ? ccb_sign_extend(masked, base.value.width)
+                                     : (long long)masked;
+        char const_line[128] = {0};
+        ccb_format_const_line(const_line, sizeof(const_line), base.value.type, masked, signed_value);
+        if (!ccb_replace_linef(body, base.const_line, "%s", const_line))
+        {
+            i = cursor;
+            continue;
+        }
+
+        string_list_remove_range(body, base.end, cursor - base.end);
+        i = base.end;
+    }
+}
+
+static bool ccb_parse_addr_expr_block(const StringList *body, size_t start,
+                                      size_t *out_begin, size_t *out_end)
+{
+    if (!body || !out_begin || !out_end || start >= body->count)
+        return false;
+
+    size_t p = ccb_skip_loc_directives(body, start);
+    if (p >= body->count)
+        return false;
+
+    size_t begin = p;
+    size_t steps = 0;
+    while (p < body->count)
+    {
+        const char *line = ccb_trim_leading_ws(body->items[p]);
+        if (!line)
+            return false;
+
+        bool addr_step = strncmp(line, "addr_global ", 12) == 0 ||
+                         strncmp(line, "addr_local ", 11) == 0 ||
+                         strncmp(line, "addr_param ", 11) == 0 ||
+                         strncmp(line, "load_local ", 11) == 0 ||
+                         strncmp(line, "load_param ", 11) == 0 ||
+                         strncmp(line, "const i64 ", 10) == 0 ||
+                         strncmp(line, "const i32 ", 10) == 0 ||
+                         strcmp(line, "convert bitcast ptr i64") == 0 ||
+                         strcmp(line, "convert sext i32 i64") == 0 ||
+                         strcmp(line, "convert zext i32 i64") == 0 ||
+                         strcmp(line, "binop add i64") == 0 ||
+                         strcmp(line, "convert bitcast i64 ptr") == 0;
+        if (!addr_step)
+            return false;
+
+        ++steps;
+        if (steps > 24)
+            return false;
+
+        if (strcmp(line, "convert bitcast i64 ptr") == 0)
+        {
+            *out_begin = begin;
+            *out_end = ccb_skip_loc_directives(body, p + 1);
+            return true;
+        }
+
+        p = ccb_skip_loc_directives(body, p + 1);
+    }
+
+    return false;
+}
+
+static bool ccb_same_addr_expr(const StringList *body,
+                               size_t a_begin, size_t a_end,
+                               size_t b_begin, size_t b_end)
+{
+    if (!body)
+        return false;
+
+    size_t a = ccb_skip_loc_directives(body, a_begin);
+    size_t b = ccb_skip_loc_directives(body, b_begin);
+    while (a < a_end && b < b_end)
+    {
+        if (!ccb_trimmed_lines_equal(body->items[a], body->items[b]))
+            return false;
+        a = ccb_skip_loc_directives(body, a + 1);
+        b = ccb_skip_loc_directives(body, b + 1);
+    }
+    return a >= a_end && b >= b_end;
+}
+
+static bool ccb_parse_const_store_after_addr(const StringList *body, size_t start,
+                                             CcbConstInfo *out_const, size_t *out_end)
+{
+    if (!body || !out_const || !out_end)
+        return false;
+
+    size_t p = ccb_skip_loc_directives(body, start);
+    if (p >= body->count || !ccb_parse_const_info(body->items[p], out_const))
+        return false;
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    if (p >= body->count)
+        return false;
+
+    char expected[64] = {0};
+    snprintf(expected, sizeof(expected), "store_indirect %s", out_const->type);
+    if (!ccb_is_exact_line(body->items[p], expected))
+        return false;
+
+    *out_end = p + 1;
+    return true;
+}
+
+static bool ccb_parse_dup_or_store_after_addr(const StringList *body, size_t start,
+                                              const char *type_name,
+                                              unsigned long long *out_or_value,
+                                              size_t *out_end)
+{
+    if (!body || !type_name || !out_or_value || !out_end)
+        return false;
+
+    size_t p = ccb_skip_loc_directives(body, start);
+    if (p >= body->count || !ccb_is_prefix_line(body->items[p], "dup"))
+        return false;
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    char expected[64] = {0};
+    snprintf(expected, sizeof(expected), "load_indirect %s", type_name);
+    if (p >= body->count || !ccb_is_exact_line(body->items[p], expected))
+        return false;
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    CcbConstInfo cinfo;
+    if (p >= body->count || !ccb_parse_const_info(body->items[p], &cinfo) || strcmp(cinfo.type, type_name) != 0)
+        return false;
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    char op_name[16] = {0};
+    char op_type[16] = {0};
+    bool unsigned_hint = false;
+    if (p >= body->count ||
+        !ccb_parse_binop_info(body->items[p], op_name, sizeof(op_name), op_type, sizeof(op_type), &unsigned_hint) ||
+        strcmp(op_name, "or") != 0 || strcmp(op_type, type_name) != 0)
+        return false;
+    (void)unsigned_hint;
+
+    p = ccb_skip_loc_directives(body, p + 1);
+    snprintf(expected, sizeof(expected), "store_indirect %s", type_name);
+    if (p >= body->count || !ccb_is_exact_line(body->items[p], expected))
+        return false;
+
+    *out_or_value = cinfo.u;
+    *out_end = p + 1;
+    return true;
+}
+
+static void ccb_opt_fold_dup_rmw_or_chains(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i < body->count)
+    {
+        size_t addr_begin = 0;
+        size_t addr_end = 0;
+        if (!ccb_parse_addr_expr_block(body, i, &addr_begin, &addr_end))
+        {
+            ++i;
+            continue;
+        }
+
+        CcbConstInfo base_const;
+        size_t base_end = 0;
+        if (!ccb_parse_const_store_after_addr(body, addr_end, &base_const, &base_end))
+        {
+            i = addr_end;
+            continue;
+        }
+
+        unsigned long long combined = base_const.u;
+        size_t cursor = base_end;
+        size_t folds = 0;
+
+        while (cursor < body->count)
+        {
+            size_t next_addr_begin = 0;
+            size_t next_addr_end = 0;
+            if (!ccb_parse_addr_expr_block(body, cursor, &next_addr_begin, &next_addr_end))
+                break;
+            if (!ccb_same_addr_expr(body, addr_begin, addr_end, next_addr_begin, next_addr_end))
+                break;
+
+            unsigned long long or_value = 0;
+            size_t rmw_end = 0;
+            if (!ccb_parse_dup_or_store_after_addr(body, next_addr_end, base_const.type, &or_value, &rmw_end))
+                break;
+
+            combined |= or_value;
+            cursor = rmw_end;
+            ++folds;
+        }
+
+        if (folds == 0)
+        {
+            i = base_end;
+            continue;
+        }
+
+        unsigned long long masked = combined & ccb_mask_for_width(base_const.width);
+        long long signed_value = ccb_type_is_signed_name(base_const.type)
+                                     ? ccb_sign_extend(masked, base_const.width)
+                                     : (long long)masked;
+        char const_line[128] = {0};
+        ccb_format_const_line(const_line, sizeof(const_line), base_const.type, masked, signed_value);
+        ccb_replace_linef(body, addr_end, "%s", const_line);
+
+        string_list_remove_range(body, base_end, cursor - base_end);
+        i = base_end;
+    }
+}
+
+static void ccb_opt_pack_byte_store_runs(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i < body->count)
+    {
+        CcbByteStorePattern p0;
+        if (!ccb_parse_byte_store_pattern(body, i, &p0))
+        {
+            ++i;
+            continue;
+        }
+
+        CcbByteStorePattern p1;
+        if (!ccb_parse_byte_store_pattern(body, p0.end, &p1) ||
+            strcmp(p0.load_op, p1.load_op) != 0 ||
+            p0.load_index != p1.load_index ||
+            p1.offset != p0.offset + 1)
+        {
+            i = p0.end;
+            continue;
+        }
+
+        CcbByteStorePattern p2;
+        CcbByteStorePattern p3;
+        bool have_four = ccb_parse_byte_store_pattern(body, p1.end, &p2) &&
+                         ccb_parse_byte_store_pattern(body, p2.end, &p3) &&
+                         strcmp(p0.load_op, p2.load_op) == 0 &&
+                         strcmp(p0.load_op, p3.load_op) == 0 &&
+                         p0.load_index == p2.load_index &&
+                         p0.load_index == p3.load_index &&
+                         p2.offset == p0.offset + 2 &&
+                         p3.offset == p0.offset + 3;
+
+        if (have_four)
+        {
+            uint32_t packed = ((uint32_t)p0.byte_value) |
+                              ((uint32_t)p1.byte_value << 8) |
+                              ((uint32_t)p2.byte_value << 16) |
+                              ((uint32_t)p3.byte_value << 24);
+            int32_t packed_i32 = (int32_t)packed;
+            ccb_replace_linef(body, p0.value_line, "  const i32 %d", (int)packed_i32);
+            ccb_replace_linef(body, p0.store_line, "  store_indirect i32");
+
+            string_list_remove_range(body, p3.start, p3.end - p3.start);
+            string_list_remove_range(body, p2.start, p2.end - p2.start);
+            string_list_remove_range(body, p1.start, p1.end - p1.start);
+            i = p0.end;
+            continue;
+        }
+
+        uint16_t packed16 = (uint16_t)(((uint16_t)p0.byte_value) |
+                                       ((uint16_t)p1.byte_value << 8));
+        int16_t packed_i16 = (int16_t)packed16;
+        ccb_replace_linef(body, p0.value_line, "  const i16 %d", (int)packed_i16);
+        ccb_replace_linef(body, p0.store_line, "  store_indirect i16");
+        string_list_remove_range(body, p1.start, p1.end - p1.start);
+        i = p0.end;
+    }
+}
+
+static void ccb_opt_remove_overwritten_indirect_stores(CcbFunctionBuilder *fb)
+{
+    if (!fb)
+        return;
+
+    StringList *body = &fb->body;
+    size_t i = 0;
+    while (i < body->count)
+    {
+        CcbIndirectStorePattern src;
+        if (!ccb_parse_indirect_store_pattern(body, i, &src))
+        {
+            ++i;
+            continue;
+        }
+
+        bool removed = false;
+        size_t j = src.end;
+        while (j < body->count)
+        {
+            size_t probe = ccb_skip_loc_directives(body, j);
+            if (probe >= body->count)
+                break;
+
+            const char *line = ccb_trim_leading_ws(body->items[probe]);
+            if (!line)
+                break;
+
+            if (strncmp(line, "label ", 6) == 0 ||
+                strncmp(line, "jump ", 5) == 0 ||
+                strncmp(line, "branch ", 7) == 0 ||
+                strncmp(line, "ret", 3) == 0 ||
+                strncmp(line, "call ", 5) == 0 ||
+                strncmp(line, "call_indirect ", 14) == 0 ||
+                strncmp(line, "load_indirect ", 14) == 0)
+            {
+                break;
+            }
+
+            if (strcmp(src.load_op, "load_local") == 0)
+            {
+                int idx = -1;
+                if (ccb_parse_local_index(line, "store_local", &idx) && idx == src.load_index)
+                    break;
+                if (ccb_parse_local_index(line, "addr_local", &idx) && idx == src.load_index)
+                    break;
+            }
+
+            CcbIndirectStorePattern dst;
+            if (ccb_parse_indirect_store_pattern(body, j, &dst))
+            {
+                if (strcmp(src.load_op, dst.load_op) == 0 &&
+                    src.load_index == dst.load_index)
+                {
+                    int src_begin = src.offset;
+                    int src_end = src.offset + src.width_bytes;
+                    int dst_begin = dst.offset;
+                    int dst_end = dst.offset + dst.width_bytes;
+                    if (dst_begin <= src_begin && dst_end >= src_end)
+                    {
+                        string_list_remove_range(body, src.start, src.end - src.start);
+                        removed = true;
+                        if (src.start > 0)
+                            i = src.start - 1;
+                        else
+                            i = 0;
+                        break;
+                    }
+                }
+                j = dst.end;
+                continue;
+            }
+
+            ++j;
+        }
+
+        if (!removed)
+            i = src.end;
     }
 }
 
@@ -3223,6 +4288,30 @@ static void ccb_function_optimize(CcbFunctionBuilder *fb, const CodegenOptions *
         if (compiler_verbose_enabled())
             compiler_verbose_logf("optimizer", "pass fold constant converts");
         ccb_opt_fold_const_converts(fb);
+
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass simplify no-op arith/bitcasts");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass simplify no-op arith/bitcasts");
+        ccb_opt_simplify_noop_arith_and_bitcasts(fb);
+
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass fold const OR store chains");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass fold const OR store chains");
+        ccb_opt_fold_const_or_store_chains(fb);
+
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass pack byte store runs");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass pack byte store runs");
+        ccb_opt_pack_byte_store_runs(fb);
+
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass remove overwritten indirect stores");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass remove overwritten indirect stores");
+        ccb_opt_remove_overwritten_indirect_stores(fb);
     }
 
     if (opts->opt_level >= 3)
@@ -3297,6 +4386,19 @@ static void ccb_function_optimize(CcbFunctionBuilder *fb, const CodegenOptions *
         if (compiler_verbose_enabled())
             compiler_verbose_logf("optimizer", "pass simplify addr_local temps");
         ccb_opt_simplify_addr_local_temp(fb);
+
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass fold const OR store chains");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass fold const OR store chains");
+        ccb_opt_fold_const_or_store_chains(fb);
+
+        if (compiler_verbose_deep_enabled())
+            compiler_verbose_treef("optimizer", "+-", "pass fold dup RMW OR chains");
+        if (compiler_verbose_enabled())
+            compiler_verbose_logf("optimizer", "pass fold dup RMW OR chains");
+        ccb_opt_fold_dup_rmw_or_chains(fb);
+
         if (compiler_verbose_deep_enabled())
             compiler_verbose_treef("optimizer", "+-", "pass prune dropped values");
         if (compiler_verbose_enabled())
@@ -4804,16 +5906,21 @@ static int ccb_emit_compound_assign_via_pointer(CcbFunctionBuilder *fb, const No
 
     ptrdiff_t addr_slot = addr_local ? (ptrdiff_t)(addr_local - fb->locals) : -1;
 
+    CcbLocal *result_tmp = ccb_local_add(fb, NULL, value_type, false, false);
+    if (!result_tmp)
+        return 1;
+    ptrdiff_t result_slot = result_tmp ? (ptrdiff_t)(result_tmp - fb->locals) : -1;
+
+    if (addr_slot >= 0)
+    {
+        addr_local = ccb_local_from_slot(fb, addr_slot);
+        if (!addr_local)
+            return 1;
+    }
+
     if (!ccb_emit_load_local(fb, addr_local))
         return 1;
     if (!ccb_emit_load_indirect(&fb->body, value_ty))
-        return 1;
-
-    CcbLocal *lhs_tmp = ccb_local_add(fb, NULL, value_type, false, false);
-    if (!lhs_tmp)
-        return 1;
-    ptrdiff_t lhs_slot = lhs_tmp ? (ptrdiff_t)(lhs_tmp - fb->locals) : -1;
-    if (!ccb_emit_store_local(fb, lhs_tmp))
         return 1;
 
     if (ccb_emit_expr_basic(fb, expr->rhs))
@@ -4821,11 +5928,9 @@ static int ccb_emit_compound_assign_via_pointer(CcbFunctionBuilder *fb, const No
     if (ccb_compound_convert_rhs(fb, expr->rhs, value_ty))
         return 1;
 
-    CcbLocal *rhs_tmp = ccb_local_add(fb, NULL, value_type, false, false);
-    if (!rhs_tmp)
+    if (ccb_emit_compound_binop_instr(fb, expr, value_ty))
         return 1;
-    ptrdiff_t rhs_slot = rhs_tmp ? (ptrdiff_t)(rhs_tmp - fb->locals) : -1;
-    if (!ccb_emit_store_local(fb, rhs_tmp))
+    if (!ccb_emit_store_local(fb, result_tmp))
         return 1;
 
     if (addr_slot >= 0)
@@ -4834,35 +5939,20 @@ static int ccb_emit_compound_assign_via_pointer(CcbFunctionBuilder *fb, const No
         if (!addr_local)
             return 1;
     }
-    if (lhs_slot >= 0)
+    if (result_slot >= 0)
     {
-        lhs_tmp = ccb_local_from_slot(fb, lhs_slot);
-        if (!lhs_tmp)
-            return 1;
-    }
-    if (rhs_slot >= 0)
-    {
-        rhs_tmp = ccb_local_from_slot(fb, rhs_slot);
-        if (!rhs_tmp)
+        result_tmp = ccb_local_from_slot(fb, result_slot);
+        if (!result_tmp)
             return 1;
     }
 
-    if (!ccb_emit_load_local(fb, lhs_tmp))
-        return 1;
-    if (!ccb_emit_load_local(fb, rhs_tmp))
-        return 1;
-    if (ccb_emit_compound_binop_instr(fb, expr, value_ty))
-        return 1;
-
-    if (!ccb_emit_store_local(fb, lhs_tmp))
-        return 1;
     if (!ccb_emit_load_local(fb, addr_local))
         return 1;
-    if (!ccb_emit_load_local(fb, lhs_tmp))
+    if (!ccb_emit_load_local(fb, result_tmp))
         return 1;
     if (!ccb_emit_store_indirect(&fb->body, value_ty))
         return 1;
-    if (!ccb_emit_load_local(fb, lhs_tmp))
+    if (!ccb_emit_load_local(fb, result_tmp))
         return 1;
 
     return 0;
@@ -5137,6 +6227,69 @@ static int ccb_emit_compound_assign(CcbFunctionBuilder *fb, const Node *expr)
                       node_kind_name(target->kind));
         return 1;
     }
+}
+
+static bool ccb_is_compound_assign_kind(NodeKind kind)
+{
+    return kind == ND_ADD_ASSIGN || kind == ND_SUB_ASSIGN ||
+           kind == ND_MUL_ASSIGN || kind == ND_DIV_ASSIGN ||
+           kind == ND_MOD_ASSIGN || kind == ND_BITAND_ASSIGN ||
+           kind == ND_BITOR_ASSIGN || kind == ND_BITXOR_ASSIGN ||
+           kind == ND_SHL_ASSIGN || kind == ND_SHR_ASSIGN;
+}
+
+static int ccb_emit_compound_assign_stmt_noresult(CcbFunctionBuilder *fb, const Node *expr)
+{
+    if (!fb || !expr || !expr->lhs || !expr->rhs)
+        return 1;
+
+    const Node *target = expr->lhs;
+    CCValueType value_ty = CC_TYPE_INVALID;
+    const Type *value_type = NULL;
+
+    switch (target->kind)
+    {
+    case ND_INDEX:
+        if (ccb_emit_index_address(fb, target, &value_ty, &value_type))
+            return 1;
+        break;
+    case ND_DEREF:
+        if (ccb_emit_deref_address(fb, target, &value_ty, &value_type))
+            return 1;
+        break;
+    case ND_MEMBER:
+        if (ccb_emit_member_address(fb, target, &value_ty, &value_type))
+            return 1;
+        break;
+    default:
+        if (ccb_emit_compound_assign(fb, expr))
+            return 1;
+        if (!ccb_emit_drop_for_type(&fb->body, ccb_type_for_expr(expr)))
+            return 1;
+        return 0;
+    }
+
+    if (type_is_address_only(value_type))
+    {
+        diag_error_at(target->src, target->line, target->col,
+                      "compound assignment not supported on this type");
+        return 1;
+    }
+
+    if (!string_list_appendf(&fb->body, "  dup %s", cc_type_name(CC_TYPE_PTR)))
+        return 1;
+    if (!ccb_emit_load_indirect(&fb->body, value_ty))
+        return 1;
+    if (ccb_emit_expr_basic(fb, expr->rhs))
+        return 1;
+    if (ccb_compound_convert_rhs(fb, expr->rhs, value_ty))
+        return 1;
+    if (ccb_emit_compound_binop_instr(fb, expr, value_ty))
+        return 1;
+    if (!ccb_emit_store_indirect(&fb->body, value_ty))
+        return 1;
+
+    return 0;
 }
 
 static bool type_is_address_only(const Type *ty)
@@ -6061,7 +7214,6 @@ static int ccb_emit_call_like(CcbFunctionBuilder *fb, const Node *expr, bool for
             {
                 if (ccb_emit_convert_between(fb, arg_ty, CC_TYPE_I32, arg))
                 {
-                    rc = 1;
                     break;
                 }
                 arg_ty = CC_TYPE_I32;
@@ -8228,6 +9380,8 @@ static int ccb_emit_stmt_basic_impl(CcbFunctionBuilder *fb, const Node *stmt)
     case ND_EXPR_STMT:
         if (stmt->lhs)
         {
+            if (ccb_is_compound_assign_kind(stmt->lhs->kind))
+                return ccb_emit_compound_assign_stmt_noresult(fb, stmt->lhs);
             if (ccb_emit_expr_basic(fb, stmt->lhs))
                 return 1;
             CCValueType expr_ty = ccb_type_for_expr(stmt->lhs);
@@ -10275,7 +11429,10 @@ int codegen_ccb_write_module(const Node *unit, const CodegenOptions *opts)
         if (codegen_ccb_resolve_module_path(opts, out_path, sizeof(out_path)))
             rc = 1;
         else
+        {
+            ccb_module_optimize(&mod, opts);
             write_rc = write_module_to_file(out_path, &mod);
+        }
     }
 
     ccb_module_free(&mod);
